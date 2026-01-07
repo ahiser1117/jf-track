@@ -1,59 +1,81 @@
-from src.collision_merging import apply_merges_to_zarr, combine_merge_results, find_collision_merges, find_directional_merges
-from src.refined_features import compute_refined_features, save_refined_features_to_zarr
-from src.visualizations import save_labeled_video, visualize_single_track
-from src.tracking import run_tracking
-from src.save_results import extract_and_save
+from src.tracking import run_two_pass_tracking, select_best_mouth_track
+from src.direction_analysis import compute_direction_analysis
+from src.save_results import save_two_pass_tracking_to_zarr
+from src.visualizations import save_two_pass_labeled_video
 
 
 if __name__ == "__main__":
     video_path = "/home/alex/Downloads/rotateAndHoldCCW_12112025_jelly1-12112025091630-0000.avi/rotateAndHoldCCW_12112025_jelly1-12112025091630-0000.avi"
+    video_path = "/home/alex/Downloads/rotateAndHoldCCW_12112025_jelly1-12112025091630-0000.avi/clip.avi"
 
     save_base_path = "./saved_videos"
-    zarr_path = "tracking_results_jf.zarr"
-    zarr_merged_path = "tracking_results_merged_jf.zarr"
+    zarr_path = "two_pass_tracking.zarr"
 
-    # Generate tracks - returns TrackingData object
-    print("Generating tracks...")
-    tracking_data, fps = run_tracking(video_path, max_frames=1000)
-    
-    # Extract features and save to Zarr
-    
-    extract_and_save(tracking_data, zarr_path, fps)
-    refined = compute_refined_features(zarr_path, pause_speed_fraction=0.05, contact_distance_fraction=0.5)
-    save_refined_features_to_zarr(zarr_path, refined)
-
-    collision_merges = find_collision_merges(zarr_path, area_threshold=80)
-    directional_merges = find_directional_merges(
-        zarr_path,
-        max_frame_gap=180,
-        max_distance_px=40,
-        distance_per_gap_px=6,
-        direction_tolerance_deg=35,
-    )
-    merges = combine_merge_results([collision_merges, directional_merges])
-    apply_merges_to_zarr(
-        zarr_path,
-        merges,
-        output_path=zarr_merged_path,
-        array_prefix="",  # merged arrays are written with prefix; originals preserved
-        keep_original=False,
-    )
-
-    # Visualize a single track
-    idx = 0
-    visualize_single_track(
+    # Run two-pass tracking: mouth (large) + bulbs (small)
+    print("Running two-pass tracking...")
+    mouth_tracking_raw, bulb_tracking, fps = run_two_pass_tracking(
         video_path,
-        zarr_path=zarr_merged_path,
-        track_id=idx,
-        output_path=f"{save_base_path}/track_{idx:02d}_visualization.mp4",
-        padding=50,
-        scale_factor=8,
-        show_refined_motion=False,
-        show_eccentricity=False,
-        show_binary_mask=True,
-        show_skeleton=False,
+        max_frames=None,
+        # Mouth detection parameters
+        mouth_min_area=35,
+        mouth_max_area=160,
+        mouth_max_disappeared=15,
+        mouth_max_distance=50,
+        # Bulb detection parameters (smaller objects)
+        bulb_min_area=5,
+        bulb_max_area=35,
+        bulb_max_disappeared=10,
+        bulb_max_distance=30,
     )
 
-    # Save labeled video with all tracks
-    output_path = f"{save_base_path}/labeled_merged_video_jf.mp4"
-    save_labeled_video(video_path, zarr_merged_path, output_path)
+    # Select the single best mouth track (in case bulbs overlapped and created false positives)
+    print("\nSelecting best mouth track...")
+    mouth_tracking = select_best_mouth_track(mouth_tracking_raw)
+
+    # Compute direction from bulb center of mass to mouth (with temporal smoothing)
+    print("\nComputing direction analysis...")
+    direction_analysis = compute_direction_analysis(
+        mouth_tracking,
+        bulb_tracking,
+        mouth_track_idx=0,  # Use first (and only) mouth track
+        smooth_window=5,    # Smooth positions over 5 frames to reduce flickering
+    )
+
+    # Save all results to zarr
+    save_two_pass_tracking_to_zarr(
+        mouth_tracking,
+        bulb_tracking,
+        direction_analysis,
+        zarr_path,
+        fps,
+    )
+
+    # Print summary
+    print("\n=== Tracking Summary ===")
+    print(f"Mouth tracks: {mouth_tracking.n_tracks}")
+    print(f"Bulb tracks: {bulb_tracking.n_tracks}")
+    print(f"Total frames: {direction_analysis.n_frames}")
+
+    # Direction statistics
+    import numpy as np
+    valid_directions = ~np.isnan(direction_analysis.direction_magnitude)
+    n_valid = np.sum(valid_directions)
+    print(f"Frames with valid direction: {n_valid} ({100*n_valid/direction_analysis.n_frames:.1f}%)")
+
+    if n_valid > 0:
+        avg_magnitude = np.nanmean(direction_analysis.direction_magnitude)
+        avg_bulb_count = np.mean(direction_analysis.bulb_count[valid_directions])
+        print(f"Average direction magnitude: {avg_magnitude:.1f} px")
+        print(f"Average bulb count per frame: {avg_bulb_count:.1f}")
+
+    # Save labeled visualization video
+    print("\n=== Generating Visualization ===")
+    output_video_path = f"{save_base_path}/two_pass_labeled_video.mp4"
+    save_two_pass_labeled_video(
+        video_path,
+        zarr_path,
+        output_video_path,
+        max_frames=1000,
+        show_direction_vector=True,
+        show_bulb_com=True,
+    )

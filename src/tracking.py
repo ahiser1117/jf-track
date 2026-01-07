@@ -1,10 +1,9 @@
 import cv2
 import numpy as np
-from scipy.interpolate import splprep, splev
 from skimage.measure import label, regionprops
-from skimage.morphology import skeletonize
 
 from src.tracker import RobustTracker, TrackingData
+from dataclasses import replace
 
 
 # --- Main Pipeline ---
@@ -60,129 +59,85 @@ def compute_background(
     return background
 
 
-def _extract_midline_skeleton(region_mask: np.ndarray, bbox, n_points: int = 5):
+def detect_objects_with_stats(
+    binary_mask: np.ndarray,
+    pixel_size_mm: float = 0.01,
+    min_area: int = 35,
+    max_area: int = 160,
+) -> list[dict]:
     """
-    Get a simple midline skeleton using skeletonization + B-spline sampling.
-    Returns a list of (x, y) coordinates in image space with fixed length.
-    """
-    # region_mask is already cropped to the bounding box
-    skeleton = skeletonize(region_mask)
-    coords = np.column_stack(np.nonzero(skeleton))  # (row, col)
+    Detects objects and calculates region properties.
 
-    # Offset to full-image coordinates
-    min_row, min_col, _, _ = bbox
-    if len(coords) > 0:
-        coords[:, 0] += min_row
-        coords[:, 1] += min_col
-        points = coords[:, [1, 0]].astype(float)  # (x, y)
-    else:
-        # Fallback: use bbox center
-        cx = (bbox[1] + bbox[3]) / 2.0
-        cy = (bbox[0] + bbox[2]) / 2.0
-        return [(cx, cy)] * n_points
-
-    # Order points along principal axis for a clean spline fit
-    if len(points) > 1:
-        centered = points - points.mean(axis=0)
-        _, _, vh = np.linalg.svd(centered, full_matrices=False)
-        axis = vh[0]
-        ordering = np.argsort(centered @ axis)
-        ordered = points[ordering]
-    else:
-        ordered = points
-
-    # Fit spline if possible, otherwise linear interpolation
-    u_existing = np.linspace(0, 1, len(ordered))
-    u_sample = np.linspace(0, 1, n_points)
-
-    if len(ordered) >= 4:
-        try:
-            tck, _ = splprep(ordered.T, s=0, k=min(3, len(ordered) - 1))
-            x_new, y_new = splev(u_sample, tck)
-            samples = list(zip(x_new, y_new))
-        except Exception:
-            x_new = np.interp(u_sample, u_existing, ordered[:, 0])
-            y_new = np.interp(u_sample, u_existing, ordered[:, 1])
-            samples = list(zip(x_new, y_new))
-    elif len(ordered) >= 2:
-        x_new = np.interp(u_sample, u_existing, ordered[:, 0])
-        y_new = np.interp(u_sample, u_existing, ordered[:, 1])
-        samples = list(zip(x_new, y_new))
-    else:
-        samples = [(ordered[0, 0], ordered[0, 1])] * n_points
-
-    return samples
-
-
-def detect_worms_with_stats(binary_mask, pixel_size_mm=0.01):
-    """
-    Detects worms and calculates MATLAB-equivalent region properties.
-    
     Args:
-        binary_mask (np.array): Thresholded boolean or uint8 image (0=bg, 1=worm).
-        pixel_size_mm (float): For converting pixel lengths to mm.
+        binary_mask: Thresholded boolean or uint8 image (0=bg, 1=object).
+        pixel_size_mm: For converting pixel lengths to mm.
+        min_area: Minimum area in pixels to consider as valid object.
+        max_area: Maximum area in pixels to consider as valid object.
 
     Returns:
-        list: A list of dictionaries containing stats for each worm.
+        list: A list of dictionaries containing stats for each detected object.
     """
-    # 1. Label connected components (equivalent to MATLAB's bwconncomp)
+    # Label connected components
     label_img = label(binary_mask)
-    
-    # 2. Extract properties (equivalent to MATLAB's regionprops)
-    # We specifically need 'eccentricity', 'area', 'centroid', 'major_axis_length'
+
+    # Extract properties
     props = regionprops(label_img)
-    
+
     detections = []
-    
+
     for prop in props:
         area = prop.area
-        
-        # Filter by area (Heuristic from define_preferences.m or user config)
-        # MATLAB: if(STATS(pp).Area <= Prefs.MaxWormArea)
-        if 35 < area < 160: 
-            
-            # MATLAB Eccentricity: Ratio of the distance between the foci of the 
-            # ellipse and its major axis length. The value is between 0 and 1.
-            # 0 = Circle, 1 = Line segment.
-            ecc = prop.eccentricity 
-            
-            # Centroid comes as (row, col) -> (y, x). We usually want (x, y).
+
+        # Filter by area
+        if min_area < area < max_area:
+            # Centroid comes as (row, col) -> (y, x). We want (x, y).
             y, x = prop.centroid
-            
+
             # Major Axis Length (in pixels)
             major_axis = prop.axis_major_length
-            
-            # Midline skeleton (5 sampled points)
-            skeleton_points = _extract_midline_skeleton(prop.image, prop.bbox, n_points=5)
 
             detections.append({
                 'centroid': (x, y),
                 'area': area,
-                'eccentricity': ecc,
                 'major_axis_length_mm': major_axis * pixel_size_mm,
                 'bounding_box': prop.bbox,  # (min_row, min_col, max_row, max_col)
-                'skeleton': skeleton_points,
             })
-            
+
     return detections
 
-def run_tracking(video_path, max_frames=None, background_samples: int = 5) -> tuple[TrackingData, float]:
+
+def run_tracking(
+    video_path: str,
+    max_frames: int | None = None,
+    background_samples: int = 5,
+    min_area: int = 35,
+    max_area: int = 160,
+    threshold: int = 10,
+    max_disappeared: int = 15,
+    max_distance: int = 50,
+) -> tuple[TrackingData, float]:
     """
     Run tracking on a video and return data-oriented tracking results.
-    
+
     Args:
         video_path: Path to video file
         max_frames: Maximum number of frames to process (None for all)
-    
+        background_samples: Number of frames to sample for background computation
+        min_area: Minimum object area in pixels
+        max_area: Maximum object area in pixels
+        threshold: Binary threshold for background subtraction
+        max_disappeared: Maximum frames a track can disappear before being removed
+        max_distance: Maximum distance for track association
+
     Returns:
         tracking_data: TrackingData object with arrays of shape (n_tracks, n_frames)
         fps: Video frame rate
     """
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
-    tracker = RobustTracker(max_disappeared=15, max_distance=50)
+    tracker = RobustTracker(max_disappeared=max_disappeared, max_distance=max_distance)
 
-    # Calculate background (mean of sampled frames)
+    # Calculate background (median of sampled frames)
     print("Calculating background...")
     background = compute_background(video_path, num_samples=background_samples, max_frames=max_frames)
     gray_bg = cv2.cvtColor(background, cv2.COLOR_BGR2GRAY)
@@ -198,12 +153,12 @@ def run_tracking(video_path, max_frames=None, background_samples: int = 5) -> tu
             break
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        
+
         # Segmentation
         diff = cv2.absdiff(gray, gray_bg)
-        _, mask = cv2.threshold(diff, 10, 255, cv2.THRESH_BINARY)
-        
-        current_stats = detect_worms_with_stats(mask)
+        _, mask = cv2.threshold(diff, threshold, 255, cv2.THRESH_BINARY)
+
+        current_stats = detect_objects_with_stats(mask, min_area=min_area, max_area=max_area)
 
         # Update Tracker
         tracker.update(current_stats)
@@ -215,9 +170,160 @@ def run_tracking(video_path, max_frames=None, background_samples: int = 5) -> tu
             break
 
     cap.release()
-    
+
     # Get data-oriented tracking results
     tracking_data = tracker.get_tracking_data()
     print(f"Tracking complete: {tracking_data.n_tracks} tracks, {tracking_data.n_frames} frames")
-    
+
     return tracking_data, fps
+
+
+def run_two_pass_tracking(
+    video_path: str,
+    max_frames: int | None = None,
+    background_samples: int = 5,
+    threshold: int = 10,
+    # Mouth (large object) parameters
+    mouth_min_area: int = 35,
+    mouth_max_area: int = 160,
+    mouth_max_disappeared: int = 15,
+    mouth_max_distance: int = 50,
+    # Bulb (small object) parameters
+    bulb_min_area: int = 5,
+    bulb_max_area: int = 35,
+    bulb_max_disappeared: int = 10,
+    bulb_max_distance: int = 30,
+) -> tuple[TrackingData, TrackingData, float]:
+    """
+    Run two-pass tracking: first for the mouth (larger object), then for bulbs (smaller objects).
+
+    Args:
+        video_path: Path to video file
+        max_frames: Maximum number of frames to process (None for all)
+        background_samples: Number of frames to sample for background computation
+        threshold: Binary threshold for background subtraction
+        mouth_min_area: Minimum area for mouth detection
+        mouth_max_area: Maximum area for mouth detection
+        mouth_max_disappeared: Max frames mouth can disappear
+        mouth_max_distance: Max distance for mouth track association
+        bulb_min_area: Minimum area for bulb detection
+        bulb_max_area: Maximum area for bulb detection
+        bulb_max_disappeared: Max frames bulb can disappear
+        bulb_max_distance: Max distance for bulb track association
+
+    Returns:
+        mouth_tracking: TrackingData for the mouth
+        bulb_tracking: TrackingData for the bulbs
+        fps: Video frame rate
+    """
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+
+    mouth_tracker = RobustTracker(max_disappeared=mouth_max_disappeared, max_distance=mouth_max_distance)
+    bulb_tracker = RobustTracker(max_disappeared=bulb_max_disappeared, max_distance=bulb_max_distance)
+
+    # Calculate background (median of sampled frames)
+    print("Calculating background...")
+    background = compute_background(video_path, num_samples=background_samples, max_frames=max_frames)
+    gray_bg = cv2.cvtColor(background, cv2.COLOR_BGR2GRAY)
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Reset to start
+
+    frame_idx = 0
+
+    while True:
+        ret, frame = cap.read()
+        frame_idx += 1
+        if not ret:
+            break
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        # Segmentation
+        diff = cv2.absdiff(gray, gray_bg)
+        _, mask = cv2.threshold(diff, threshold, 255, cv2.THRESH_BINARY)
+
+        # Detect mouth (larger objects)
+        mouth_stats = detect_objects_with_stats(mask, min_area=mouth_min_area, max_area=mouth_max_area)
+        mouth_tracker.update(mouth_stats)
+
+        # Detect bulbs (smaller objects)
+        bulb_stats = detect_objects_with_stats(mask, min_area=bulb_min_area, max_area=bulb_max_area)
+        bulb_tracker.update(bulb_stats)
+
+        if frame_idx % 100 == 0:
+            print(f"Processed {frame_idx} frames")
+
+        if max_frames is not None and frame_idx >= max_frames:
+            break
+
+    cap.release()
+
+    # Get data-oriented tracking results
+    mouth_tracking = mouth_tracker.get_tracking_data()
+    bulb_tracking = bulb_tracker.get_tracking_data()
+
+    print(f"Mouth tracking complete: {mouth_tracking.n_tracks} tracks, {mouth_tracking.n_frames} frames")
+    print(f"Bulb tracking complete: {bulb_tracking.n_tracks} tracks, {bulb_tracking.n_frames} frames")
+
+    return mouth_tracking, bulb_tracking, fps
+
+
+def select_best_mouth_track(mouth_tracking: TrackingData) -> TrackingData:
+    """
+    Select the single best mouth track from multiple candidates.
+
+    Selection criteria (in order of priority):
+    1. Most valid (non-NaN) frames - longest track duration
+    2. Tie-breaker: highest average area
+
+    Args:
+        mouth_tracking: TrackingData potentially containing multiple mouth tracks
+
+    Returns:
+        TrackingData with only the single best mouth track
+    """
+    if mouth_tracking.n_tracks == 0:
+        print("Warning: No mouth tracks found")
+        return mouth_tracking
+
+    if mouth_tracking.n_tracks == 1:
+        print("Single mouth track found, no selection needed")
+        return mouth_tracking
+
+    # Calculate valid frame counts for each track
+    valid_counts = np.sum(~np.isnan(mouth_tracking.x), axis=1)
+
+    # Calculate average areas for tie-breaking
+    avg_areas = np.nanmean(mouth_tracking.area, axis=1)
+
+    # Find track with most valid frames
+    max_valid = np.max(valid_counts)
+    candidates = np.where(valid_counts == max_valid)[0]
+
+    if len(candidates) == 1:
+        best_idx = candidates[0]
+    else:
+        # Tie-breaker: highest average area among candidates
+        candidate_areas = avg_areas[candidates]
+        best_idx = candidates[np.argmax(candidate_areas)]
+
+    best_track_id = mouth_tracking.track_ids[best_idx]
+    print(f"Selected mouth track {best_track_id} from {mouth_tracking.n_tracks} candidates")
+    print(f"  Valid frames: {valid_counts[best_idx]}, Avg area: {avg_areas[best_idx]:.1f} px")
+
+    # Create new TrackingData with only the selected track
+    return TrackingData(
+        n_tracks=1,
+        n_frames=mouth_tracking.n_frames,
+        track_ids=np.array([best_track_id]),
+        x=mouth_tracking.x[best_idx:best_idx+1, :],
+        y=mouth_tracking.y[best_idx:best_idx+1, :],
+        area=mouth_tracking.area[best_idx:best_idx+1, :],
+        major_axis_length_mm=mouth_tracking.major_axis_length_mm[best_idx:best_idx+1, :],
+        bbox_min_row=mouth_tracking.bbox_min_row[best_idx:best_idx+1, :],
+        bbox_min_col=mouth_tracking.bbox_min_col[best_idx:best_idx+1, :],
+        bbox_max_row=mouth_tracking.bbox_max_row[best_idx:best_idx+1, :],
+        bbox_max_col=mouth_tracking.bbox_max_col[best_idx:best_idx+1, :],
+        frame=mouth_tracking.frame[best_idx:best_idx+1, :],
+    )

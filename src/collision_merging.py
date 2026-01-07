@@ -265,10 +265,10 @@ def find_collision_merges(
     y = np.array(root["y"])
     area = np.array(root["area"])
 
-    if "Direction" in root:
-        direction = np.array(root["Direction"])
-    else:
-        direction = np.full_like(x, np.nan)
+    # Compute direction from position
+    dx = np.diff(x, axis=1, prepend=np.nan)
+    dy = -np.diff(y, axis=1, prepend=np.nan)
+    direction = (np.degrees(np.arctan2(dx, dy)) % 360.0).astype(float)
 
     stats = _collect_track_stats(x, y, direction, track_ids)
     stats_by_id = {s.track_id: s for s in stats}
@@ -385,14 +385,10 @@ def find_directional_merges(
     x = np.array(root["x"])
     y = np.array(root["y"])
 
-    if "Direction" in root:
-        direction = np.array(root["Direction"])
-    else:
-        dir_x = np.array(root["SmoothX"]) if "SmoothX" in root else x
-        dir_y = np.array(root["SmoothY"]) if "SmoothY" in root else y
-        dx = np.diff(dir_x, axis=1, prepend=np.nan)
-        dy = -np.diff(dir_y, axis=1, prepend=np.nan)
-        direction = (np.degrees(np.arctan2(dx, dy)) % 360.0).astype(float)
+    # Compute direction from position if not stored
+    dx = np.diff(x, axis=1, prepend=np.nan)
+    dy = -np.diff(y, axis=1, prepend=np.nan)
+    direction = (np.degrees(np.arctan2(dx, dy)) % 360.0).astype(float)
 
     stats = _collect_track_stats(x, y, direction, track_ids)
     stats_by_id = {s.track_id: s for s in stats}
@@ -527,6 +523,7 @@ def apply_merges_to_zarr(
     output_path: str | None = None,
     array_prefix: str = "merged_",
     keep_original: bool = True,
+    min_track_length: int = 0,
 ) -> None:
     """
     Apply merges by stitching tracks together into new merged tracks while
@@ -541,6 +538,8 @@ def apply_merges_to_zarr(
         array_prefix: Optional prefix for merged track arrays in the new store.
         keep_original: If True, copies all original arrays to `original/`
                        inside the destination store for lossless reference.
+        min_track_length: Minimum number of valid frames for a track to be kept.
+                          Tracks shorter than this threshold are removed.
     """
     if not merge_result.merges:
         print("No merge candidates found; writing passthrough copy with originals preserved.")
@@ -666,6 +665,27 @@ def apply_merges_to_zarr(
         merged_track_only_stacked[name] = np.array(vals)
 
     merged_track_ids_arr = np.array(merged_track_ids, dtype=int)
+
+    # Filter out short tracks if min_track_length is specified
+    if min_track_length > 0 and "x" in merged_arrays_stacked:
+        x_merged = merged_arrays_stacked["x"]
+        # Count valid (non-NaN) frames per track
+        valid_counts = np.sum(~np.isnan(x_merged), axis=1)
+        keep_mask = valid_counts >= min_track_length
+
+        n_before = len(merged_track_ids_arr)
+        n_removed = n_before - np.sum(keep_mask)
+        if n_removed > 0:
+            print(f"Removing {n_removed} tracks with fewer than {min_track_length} frames")
+
+        # Filter all arrays
+        for name in merged_arrays_stacked:
+            merged_arrays_stacked[name] = merged_arrays_stacked[name][keep_mask]
+        for name in merged_track_only_stacked:
+            merged_track_only_stacked[name] = merged_track_only_stacked[name][keep_mask]
+        merged_track_ids_arr = merged_track_ids_arr[keep_mask]
+        merged_sources = [src for src, keep in zip(merged_sources, keep_mask) if keep]
+
     dest.attrs["merged_n_tracks"] = int(merged_track_ids_arr.size)
 
     # Persist merged track arrays with optional prefix
