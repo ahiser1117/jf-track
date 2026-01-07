@@ -1,9 +1,7 @@
 import cv2
 import numpy as np
 from skimage.measure import label, regionprops
-
 from src.tracker import RobustTracker, TrackingData
-from dataclasses import replace
 
 
 # --- Main Pipeline ---
@@ -193,6 +191,11 @@ def run_two_pass_tracking(
     bulb_max_area: int = 35,
     bulb_max_disappeared: int = 10,
     bulb_max_distance: int = 30,
+    # Adaptive background parameters (for rotating backgrounds)
+    adaptive_background: bool = False,
+    rotation_start_threshold_deg: float = 0.5,
+    rotation_stop_threshold_deg: float = 0.1,
+    rotation_center: tuple[float, float] | None = None,
 ) -> tuple[TrackingData, TrackingData, float]:
     """
     Run two-pass tracking: first for the mouth (larger object), then for bulbs (smaller objects).
@@ -210,6 +213,10 @@ def run_two_pass_tracking(
         bulb_max_area: Maximum area for bulb detection
         bulb_max_disappeared: Max frames bulb can disappear
         bulb_max_distance: Max distance for bulb track association
+        adaptive_background: Enable rotation-compensated background subtraction
+        rotation_start_threshold_deg: Degrees/frame to trigger rotation detection
+        rotation_stop_threshold_deg: Degrees/frame to consider rotation stopped
+        rotation_center: Fixed rotation center (cx, cy), or None for auto-detection
 
     Returns:
         mouth_tracking: TrackingData for the mouth
@@ -222,10 +229,28 @@ def run_two_pass_tracking(
     mouth_tracker = RobustTracker(max_disappeared=mouth_max_disappeared, max_distance=mouth_max_distance)
     bulb_tracker = RobustTracker(max_disappeared=bulb_max_disappeared, max_distance=bulb_max_distance)
 
-    # Calculate background (median of sampled frames)
-    print("Calculating background...")
-    background = compute_background(video_path, num_samples=background_samples, max_frames=max_frames)
-    gray_bg = cv2.cvtColor(background, cv2.COLOR_BGR2GRAY)
+    # Initialize background (static or adaptive)
+    bg_manager = None
+    if adaptive_background:
+        from src.adaptive_background import AdaptiveBackgroundManager
+
+        print("Initializing adaptive background manager...")
+        bg_manager = AdaptiveBackgroundManager(
+            video_path,
+            initial_bg_samples=background_samples,
+            rotation_start_threshold_deg=rotation_start_threshold_deg,
+            rotation_stop_threshold_deg=rotation_stop_threshold_deg,
+        )
+        bg_manager.initialize(
+            max_frames=max_frames,
+            initial_center_estimate=rotation_center,
+        )
+        gray_bg = None  # Will be set per-frame
+    else:
+        # Calculate static background (median of sampled frames)
+        print("Calculating background...")
+        background = compute_background(video_path, num_samples=background_samples, max_frames=max_frames)
+        gray_bg = cv2.cvtColor(background, cv2.COLOR_BGR2GRAY)
 
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Reset to start
 
@@ -238,6 +263,10 @@ def run_two_pass_tracking(
             break
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        # Get appropriate background for this frame
+        if bg_manager is not None:
+            gray_bg = bg_manager.get_background(frame_idx - 1, gray)
 
         # Segmentation
         diff = cv2.absdiff(gray, gray_bg)
@@ -258,6 +287,15 @@ def run_two_pass_tracking(
             break
 
     cap.release()
+
+    # Report rotation episodes if adaptive background was used
+    if bg_manager is not None:
+        episodes = bg_manager.get_rotation_episodes()
+        if episodes:
+            print(f"\nDetected {len(episodes)} rotation episode(s):")
+            for i, ep in enumerate(episodes):
+                print(f"  Episode {i+1}: frames {ep.start_frame}-{ep.end_frame}, "
+                      f"total rotation: {ep.total_rotation_deg:.1f} deg")
 
     # Get data-oriented tracking results
     mouth_tracking = mouth_tracker.get_tracking_data()

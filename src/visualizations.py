@@ -7,9 +7,11 @@ def save_two_pass_labeled_video(
     video_path: str,
     zarr_path: str,
     output_path: str,
-    max_frames: int = 500,
+    max_frames: int | None = None,
     show_direction_vector: bool = True,
     show_bulb_com: bool = True,
+    background_mode: str = "original",
+    diff_threshold: int = 10,
 ):
     """
     Save a labeled video with two-pass tracking annotations (mouth + bulbs).
@@ -21,6 +23,11 @@ def save_two_pass_labeled_video(
         max_frames: Maximum number of frames to process
         show_direction_vector: Draw direction vector from bulb CoM to mouth
         show_bulb_com: Show bulb center of mass marker
+        background_mode: What to display as background:
+            - "original": Original video frames (default)
+            - "diff": Background subtraction difference image (grayscale)
+            - "mask": Binary mask after thresholding
+        diff_threshold: Threshold value for binary mask (only used when background_mode="mask")
     """
     root = zarr.open_group(zarr_path, mode='r')
 
@@ -51,12 +58,28 @@ def save_two_pass_labeled_video(
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    # Compute background if needed for diff or mask mode
+    gray_bg = None
+    if background_mode in ("diff", "mask"):
+        print("Computing background for visualization...")
+        frame_indices_bg = np.linspace(0, total_frames - 1, 20).astype(int)
+        bg_frames = []
+        for idx in frame_indices_bg:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ret, frame = cap.read()
+            if ret:
+                bg_frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32))
+        gray_bg = np.median(bg_frames, axis=0).astype(np.uint8)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Reset to start
 
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # type: ignore
     out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
 
     print(f"Saving two-pass labeled video to {output_path}...")
     print(f"  Mouth tracks: {n_mouth_tracks}, Bulb tracks: {n_bulb_tracks}")
+    print(f"  Background mode: {background_mode}")
 
     # Colors
     MOUTH_COLOR = (0, 165, 255)  # Orange (BGR)
@@ -64,10 +87,26 @@ def save_two_pass_labeled_video(
     COM_COLOR = (0, 255, 255)    # Yellow (BGR)
     DIRECTION_COLOR = (0, 255, 0)  # Green (BGR)
 
+    if max_frames is None:
+        max_frames = n_frames
+        
     for frame_idx in range(min(n_frames, max_frames)):
         ret, frame = cap.read()
         if not ret:
             break
+
+        # Apply background mode transformation
+        if background_mode == "diff" and gray_bg is not None:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            diff = cv2.absdiff(gray, gray_bg)
+            # Scale diff to use full dynamic range for better visibility
+            diff_scaled = cv2.normalize(diff, None, 0, 255, cv2.NORM_MINMAX)
+            frame = cv2.cvtColor(diff_scaled, cv2.COLOR_GRAY2BGR)
+        elif background_mode == "mask" and gray_bg is not None:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            diff = cv2.absdiff(gray, gray_bg)
+            _, mask = cv2.threshold(diff, diff_threshold, 255, cv2.THRESH_BINARY)
+            frame = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
 
         # Draw bulb tracks (smaller circles, cyan)
         for track_idx in range(n_bulb_tracks):
