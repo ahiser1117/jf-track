@@ -4,6 +4,43 @@ from skimage.measure import label, regionprops
 from src.tracker import RobustTracker, TrackingData
 
 
+def create_circular_roi_mask(height: int, width: int) -> np.ndarray:
+    """
+    Create a circular region-of-interest mask.
+
+    The circle is centered at the middle of the frame with radius min(width, height)/2.
+    This constrains tracking to the central circular region where the jellyfish is expected.
+
+    Args:
+        height: Frame height in pixels
+        width: Frame width in pixels
+
+    Returns:
+        Binary mask (uint8) where 255 = inside ROI, 0 = outside
+    """
+    mask = np.zeros((height, width), dtype=np.uint8)
+    center = (width // 2, height // 2)
+    radius = min(width, height) // 2
+    cv2.circle(mask, center, radius, 255, -1)
+    return mask
+
+
+def get_roi_params(height: int, width: int) -> tuple[tuple[int, int], int]:
+    """
+    Get ROI circle parameters for visualization.
+
+    Args:
+        height: Frame height in pixels
+        width: Frame width in pixels
+
+    Returns:
+        (center, radius) where center is (cx, cy)
+    """
+    center = (width // 2, height // 2)
+    radius = min(width, height) // 2
+    return center, radius
+
+
 # --- Main Pipeline ---
 
 def compute_background(
@@ -179,7 +216,7 @@ def run_tracking(
 def run_two_pass_tracking(
     video_path: str,
     max_frames: int | None = None,
-    background_samples: int = 5,
+    background_buffer_size: int = 10,
     threshold: int = 10,
     # Mouth (large object) parameters
     mouth_min_area: int = 35,
@@ -193,17 +230,19 @@ def run_two_pass_tracking(
     bulb_max_distance: int = 30,
     # Adaptive background parameters (for rotating backgrounds)
     adaptive_background: bool = False,
-    rotation_start_threshold_deg: float = 0.5,
-    rotation_stop_threshold_deg: float = 0.1,
+    rotation_start_threshold_deg: float = 0.01,
+    rotation_stop_threshold_deg: float = 0.005,
     rotation_center: tuple[float, float] | None = None,
 ) -> tuple[TrackingData, TrackingData, float]:
     """
     Run two-pass tracking: first for the mouth (larger object), then for bulbs (smaller objects).
 
+    Uses a rolling buffer of recent frames for background computation.
+
     Args:
         video_path: Path to video file
         max_frames: Maximum number of frames to process (None for all)
-        background_samples: Number of frames to sample for background computation
+        background_buffer_size: Number of recent frames to use for background (default 10)
         threshold: Binary threshold for background subtraction
         mouth_min_area: Minimum area for mouth detection
         mouth_max_area: Maximum area for mouth detection
@@ -229,15 +268,14 @@ def run_two_pass_tracking(
     mouth_tracker = RobustTracker(max_disappeared=mouth_max_disappeared, max_distance=mouth_max_distance)
     bulb_tracker = RobustTracker(max_disappeared=bulb_max_disappeared, max_distance=bulb_max_distance)
 
-    # Initialize background (static or adaptive)
-    bg_manager = None
+    # Initialize background manager
     if adaptive_background:
         from src.adaptive_background import AdaptiveBackgroundManager
 
-        print("Initializing adaptive background manager...")
+        print(f"Initializing adaptive background manager (buffer_size={background_buffer_size})...")
         bg_manager = AdaptiveBackgroundManager(
             video_path,
-            initial_bg_samples=background_samples,
+            buffer_size=background_buffer_size,
             rotation_start_threshold_deg=rotation_start_threshold_deg,
             rotation_stop_threshold_deg=rotation_stop_threshold_deg,
         )
@@ -245,32 +283,50 @@ def run_two_pass_tracking(
             max_frames=max_frames,
             initial_center_estimate=rotation_center,
         )
-        gray_bg = None  # Will be set per-frame
     else:
-        # Calculate static background (median of sampled frames)
-        print("Calculating background...")
-        background = compute_background(video_path, num_samples=background_samples, max_frames=max_frames)
-        gray_bg = cv2.cvtColor(background, cv2.COLOR_BGR2GRAY)
+        from src.adaptive_background import RollingBackgroundManager
+
+        print(f"Initializing rolling background manager (buffer_size={background_buffer_size})...")
+        bg_manager = RollingBackgroundManager(buffer_size=background_buffer_size)
 
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Reset to start
+
+    # Create circular ROI mask (jellyfish expected within central circle)
+    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    roi_mask = create_circular_roi_mask(frame_height, frame_width)
+    roi_center, roi_radius = get_roi_params(frame_height, frame_width)
+    print(f"ROI mask: circle at ({roi_center[0]}, {roi_center[1]}) with radius {roi_radius}")
 
     frame_idx = 0
 
     while True:
         ret, frame = cap.read()
-        frame_idx += 1
         if not ret:
             break
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        # Get appropriate background for this frame
-        if bg_manager is not None:
-            gray_bg = bg_manager.get_background(frame_idx - 1, gray)
+        # Get/update background
+        if adaptive_background:
+            gray_bg = bg_manager.get_background(frame_idx, gray)
+        else:
+            bg_manager.update(gray)
+            if not bg_manager.is_ready():
+                # Not enough frames yet, skip processing
+                frame_idx += 1
+                if frame_idx % 100 == 0:
+                    curr, total = bg_manager.buffer_fill()
+                    print(f"Filling background buffer: {curr}/{total}")
+                continue
+            gray_bg = bg_manager.get_background()
 
         # Segmentation
         diff = cv2.absdiff(gray, gray_bg)
         _, mask = cv2.threshold(diff, threshold, 255, cv2.THRESH_BINARY)
+
+        # Apply circular ROI mask - only consider detections within the ROI
+        mask = cv2.bitwise_and(mask, roi_mask)
 
         # Detect mouth (larger objects)
         mouth_stats = detect_objects_with_stats(mask, min_area=mouth_min_area, max_area=mouth_max_area)
@@ -279,6 +335,8 @@ def run_two_pass_tracking(
         # Detect bulbs (smaller objects)
         bulb_stats = detect_objects_with_stats(mask, min_area=bulb_min_area, max_area=bulb_max_area)
         bulb_tracker.update(bulb_stats)
+
+        frame_idx += 1
 
         if frame_idx % 100 == 0:
             print(f"Processed {frame_idx} frames")
@@ -289,7 +347,7 @@ def run_two_pass_tracking(
     cap.release()
 
     # Report rotation episodes if adaptive background was used
-    if bg_manager is not None:
+    if adaptive_background:
         episodes = bg_manager.get_rotation_episodes()
         if episodes:
             print(f"\nDetected {len(episodes)} rotation episode(s):")
@@ -307,61 +365,120 @@ def run_two_pass_tracking(
     return mouth_tracking, bulb_tracking, fps
 
 
-def select_best_mouth_track(mouth_tracking: TrackingData) -> TrackingData:
+def merge_mouth_tracks(mouth_tracking: TrackingData) -> TrackingData:
     """
-    Select the single best mouth track from multiple candidates.
+    Merge multiple mouth track segments into a single continuous track.
 
-    Selection criteria (in order of priority):
-    1. Most valid (non-NaN) frames - longest track duration
-    2. Tie-breaker: highest average area
+    The mouth may be temporarily lost (e.g., due to occlusion) and reacquired,
+    creating multiple non-overlapping track segments. This function links them
+    into one unified track.
+
+    For frames where multiple tracks have data (overlap), the track with the
+    larger area is used.
 
     Args:
-        mouth_tracking: TrackingData potentially containing multiple mouth tracks
+        mouth_tracking: TrackingData potentially containing multiple mouth track segments
 
     Returns:
-        TrackingData with only the single best mouth track
+        TrackingData with a single merged mouth track
     """
     if mouth_tracking.n_tracks == 0:
         print("Warning: No mouth tracks found")
         return mouth_tracking
 
     if mouth_tracking.n_tracks == 1:
-        print("Single mouth track found, no selection needed")
+        print("Single mouth track found, no merging needed")
         return mouth_tracking
 
-    # Calculate valid frame counts for each track
-    valid_counts = np.sum(~np.isnan(mouth_tracking.x), axis=1)
+    n_frames = mouth_tracking.n_frames
+    n_tracks = mouth_tracking.n_tracks
 
-    # Calculate average areas for tie-breaking
-    avg_areas = np.nanmean(mouth_tracking.area, axis=1)
+    # Initialize merged arrays with NaN
+    merged_x = np.full(n_frames, np.nan)
+    merged_y = np.full(n_frames, np.nan)
+    merged_area = np.full(n_frames, np.nan)
+    merged_major_axis = np.full(n_frames, np.nan)
+    merged_bbox_min_row = np.full(n_frames, np.nan)
+    merged_bbox_min_col = np.full(n_frames, np.nan)
+    merged_bbox_max_row = np.full(n_frames, np.nan)
+    merged_bbox_max_col = np.full(n_frames, np.nan)
+    merged_frame = np.full(n_frames, np.nan)
 
-    # Find track with most valid frames
-    max_valid = np.max(valid_counts)
-    candidates = np.where(valid_counts == max_valid)[0]
+    # Track statistics for reporting
+    tracks_used = set()
+    overlap_frames = 0
 
-    if len(candidates) == 1:
-        best_idx = candidates[0]
-    else:
-        # Tie-breaker: highest average area among candidates
-        candidate_areas = avg_areas[candidates]
-        best_idx = candidates[np.argmax(candidate_areas)]
+    # For each frame, pick the best track data
+    for frame_idx in range(n_frames):
+        # Find all tracks with valid data at this frame
+        valid_tracks = []
+        for track_idx in range(n_tracks):
+            if not np.isnan(mouth_tracking.x[track_idx, frame_idx]):
+                valid_tracks.append(track_idx)
 
-    best_track_id = mouth_tracking.track_ids[best_idx]
-    print(f"Selected mouth track {best_track_id} from {mouth_tracking.n_tracks} candidates")
-    print(f"  Valid frames: {valid_counts[best_idx]}, Avg area: {avg_areas[best_idx]:.1f} px")
+        if len(valid_tracks) == 0:
+            # No track has data for this frame
+            continue
+        elif len(valid_tracks) == 1:
+            # Exactly one track has data - use it
+            best_idx = valid_tracks[0]
+        else:
+            # Multiple tracks have data (overlap) - pick the one with largest area
+            overlap_frames += 1
+            areas = [mouth_tracking.area[t, frame_idx] for t in valid_tracks]
+            best_idx = valid_tracks[np.argmax(areas)]
 
-    # Create new TrackingData with only the selected track
+        # Copy data from best track
+        tracks_used.add(best_idx)
+        merged_x[frame_idx] = mouth_tracking.x[best_idx, frame_idx]
+        merged_y[frame_idx] = mouth_tracking.y[best_idx, frame_idx]
+        merged_area[frame_idx] = mouth_tracking.area[best_idx, frame_idx]
+        merged_major_axis[frame_idx] = mouth_tracking.major_axis_length_mm[best_idx, frame_idx]
+        merged_bbox_min_row[frame_idx] = mouth_tracking.bbox_min_row[best_idx, frame_idx]
+        merged_bbox_min_col[frame_idx] = mouth_tracking.bbox_min_col[best_idx, frame_idx]
+        merged_bbox_max_row[frame_idx] = mouth_tracking.bbox_max_row[best_idx, frame_idx]
+        merged_bbox_max_col[frame_idx] = mouth_tracking.bbox_max_col[best_idx, frame_idx]
+        merged_frame[frame_idx] = mouth_tracking.frame[best_idx, frame_idx]
+
+    # Report what was merged
+    valid_count = np.sum(~np.isnan(merged_x))
+    track_ids_used = [mouth_tracking.track_ids[i] for i in sorted(tracks_used)]
+    print(f"Merged {len(tracks_used)} mouth track segments: {track_ids_used}")
+    print(f"  Total valid frames: {valid_count}, Overlap frames: {overlap_frames}")
+
+    # Find gaps in the merged track
+    valid_mask = ~np.isnan(merged_x)
+    if np.any(valid_mask):
+        valid_indices = np.where(valid_mask)[0]
+        gaps = []
+        for i in range(len(valid_indices) - 1):
+            gap_start = valid_indices[i]
+            gap_end = valid_indices[i + 1]
+            if gap_end - gap_start > 1:
+                gaps.append((gap_start + 1, gap_end - 1, gap_end - gap_start - 1))
+        if gaps:
+            print(f"  Gaps in merged track: {len(gaps)}")
+            for start, end, length in gaps[:5]:  # Show first 5 gaps
+                print(f"    Frames {start}-{end} ({length} frames)")
+            if len(gaps) > 5:
+                print(f"    ... and {len(gaps) - 5} more gaps")
+
+    # Create new TrackingData with merged track
     return TrackingData(
         n_tracks=1,
-        n_frames=mouth_tracking.n_frames,
-        track_ids=np.array([best_track_id]),
-        x=mouth_tracking.x[best_idx:best_idx+1, :],
-        y=mouth_tracking.y[best_idx:best_idx+1, :],
-        area=mouth_tracking.area[best_idx:best_idx+1, :],
-        major_axis_length_mm=mouth_tracking.major_axis_length_mm[best_idx:best_idx+1, :],
-        bbox_min_row=mouth_tracking.bbox_min_row[best_idx:best_idx+1, :],
-        bbox_min_col=mouth_tracking.bbox_min_col[best_idx:best_idx+1, :],
-        bbox_max_row=mouth_tracking.bbox_max_row[best_idx:best_idx+1, :],
-        bbox_max_col=mouth_tracking.bbox_max_col[best_idx:best_idx+1, :],
-        frame=mouth_tracking.frame[best_idx:best_idx+1, :],
+        n_frames=n_frames,
+        track_ids=np.array([0]),  # New unified track ID
+        x=merged_x.reshape(1, -1),
+        y=merged_y.reshape(1, -1),
+        area=merged_area.reshape(1, -1),
+        major_axis_length_mm=merged_major_axis.reshape(1, -1),
+        bbox_min_row=merged_bbox_min_row.reshape(1, -1),
+        bbox_min_col=merged_bbox_min_col.reshape(1, -1),
+        bbox_max_row=merged_bbox_max_row.reshape(1, -1),
+        bbox_max_col=merged_bbox_max_col.reshape(1, -1),
+        frame=merged_frame.reshape(1, -1),
     )
+
+
+# Keep old name as alias for backwards compatibility
+select_best_mouth_track = merge_mouth_tracks

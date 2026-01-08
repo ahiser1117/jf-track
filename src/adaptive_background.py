@@ -2,9 +2,9 @@
 Adaptive background subtraction with rotation compensation.
 
 This module provides classes for handling videos where the background rotates
-around a fixed center point. It automatically detects rotation episodes,
-estimates rotation parameters, and provides frame-by-frame compensated
-backgrounds for accurate segmentation.
+around a fixed center point. It uses a rolling buffer of recent frames,
+estimates rotation for alignment, and computes the background as an average
+of aligned frames.
 """
 
 import cv2
@@ -12,6 +12,7 @@ import numpy as np
 from enum import Enum
 from dataclasses import dataclass, field
 from collections import deque
+from typing import NamedTuple
 
 
 class RotationState(Enum):
@@ -38,6 +39,70 @@ class RotationEpisode:
     rotation_center: tuple[float, float] = (0.0, 0.0)
     angular_velocity_deg: float = 0.0  # Average degrees per frame
     total_rotation_deg: float = 0.0    # Cumulative rotation
+
+
+class BufferedFrame(NamedTuple):
+    """A frame stored in the rolling buffer with its cumulative rotation."""
+    frame: np.ndarray           # Grayscale frame
+    frame_idx: int              # Original frame index
+    cumulative_rotation: float  # Degrees rotated since this frame was added
+
+
+class RollingBackgroundManager:
+    """
+    Manages a rolling background computed from the last N frames.
+
+    This is a simple non-adaptive background manager that maintains
+    a buffer of recent frames and computes the background as their median.
+    """
+
+    def __init__(self, buffer_size: int = 10):
+        """
+        Args:
+            buffer_size: Number of recent frames to use for background (default 10)
+        """
+        self.buffer_size = buffer_size
+        self._frame_buffer: deque[np.ndarray] = deque(maxlen=buffer_size)
+        self._cached_background: np.ndarray | None = None
+        self._cache_valid: bool = False
+
+    def update(self, frame: np.ndarray) -> None:
+        """
+        Add a new frame to the buffer.
+
+        Args:
+            frame: Grayscale frame to add
+        """
+        self._frame_buffer.append(frame.copy())
+        self._cache_valid = False
+
+    def get_background(self) -> np.ndarray:
+        """
+        Get the current background computed from buffered frames.
+
+        Returns:
+            Background image as grayscale uint8
+        """
+        if not self._frame_buffer:
+            raise ValueError("No frames in buffer")
+
+        if self._cache_valid and self._cached_background is not None:
+            return self._cached_background
+
+        # Compute median of buffered frames
+        frames = np.array([f.astype(np.float32) for f in self._frame_buffer])
+        self._cached_background = np.median(frames, axis=0).astype(np.uint8)
+        self._cache_valid = True
+
+        return self._cached_background
+
+    def is_ready(self) -> bool:
+        """Check if buffer has enough frames for a valid background."""
+        return len(self._frame_buffer) >= min(3, self.buffer_size)
+
+    def buffer_fill(self) -> tuple[int, int]:
+        """Get current buffer fill (current, max)."""
+        return len(self._frame_buffer), self.buffer_size
 
 
 class RotationEstimator:
@@ -189,12 +254,17 @@ class RotationEstimator:
 
 class AdaptiveBackgroundManager:
     """
-    Manages adaptive background for rotation-compensated tracking.
+    Manages adaptive background for rotation-compensated tracking using
+    a rolling buffer of aligned frames.
 
     State Machine:
-    - STATIC: Uses precomputed static background
-    - ROTATING: Rotates reference background to match current orientation
-    - TRANSITION: Collecting frames for new static background
+    - STATIC: Uses rolling average of last N frames (no rotation compensation)
+    - ROTATING: Aligns buffered frames to current orientation before averaging
+    - TRANSITION: Collecting frames for new static rolling buffer
+
+    The key improvement is using a buffer of recent frames rather than a single
+    reference. During rotation, each buffered frame is rotated to align with
+    the current frame orientation before computing the median background.
 
     Usage:
         manager = AdaptiveBackgroundManager(video_path)
@@ -209,7 +279,7 @@ class AdaptiveBackgroundManager:
         self,
         video_path: str,
         # Background computation
-        initial_bg_samples: int = 10,
+        buffer_size: int = 10,
         transition_bg_frames: int = 30,
         # Rotation detection thresholds
         rotation_start_threshold_deg: float = 0.5,
@@ -224,7 +294,7 @@ class AdaptiveBackgroundManager:
         """
         Args:
             video_path: Path to video file
-            initial_bg_samples: Frames to sample for initial background
+            buffer_size: Number of recent frames to use for background (default 10)
             transition_bg_frames: Frames to collect after rotation stops
             rotation_start_threshold_deg: Min angle/frame to trigger rotation
             rotation_stop_threshold_deg: Max angle/frame to consider stopped
@@ -234,7 +304,7 @@ class AdaptiveBackgroundManager:
             angle_smoothing_window: Frames to smooth rotation estimates
         """
         self.video_path = video_path
-        self.initial_bg_samples = initial_bg_samples
+        self.buffer_size = buffer_size
         self.transition_bg_frames = transition_bg_frames
         self.rotation_start_threshold_deg = rotation_start_threshold_deg
         self.rotation_stop_threshold_deg = rotation_stop_threshold_deg
@@ -249,11 +319,13 @@ class AdaptiveBackgroundManager:
 
         # State
         self._state = RotationState.STATIC
-        self._static_background: np.ndarray | None = None
-        self._reference_background: np.ndarray | None = None  # For rotation
         self._rotation_center: tuple[float, float] | None = None
         self._cumulative_rotation_deg: float = 0.0
         self._prev_frame: np.ndarray | None = None
+        self._frame_shape: tuple[int, int] | None = None
+
+        # Rolling frame buffer: stores (frame, cumulative_rotation_when_added)
+        self._frame_buffer: deque[BufferedFrame] = deque(maxlen=buffer_size)
 
         # Rotation detection history
         self._angle_history: deque[float] = deque(maxlen=angle_smoothing_window)
@@ -266,12 +338,16 @@ class AdaptiveBackgroundManager:
         self._rotation_episodes: list[RotationEpisode] = []
         self._current_episode: RotationEpisode | None = None
 
-        # Improved center estimation
-        self._rotation_start_frame: np.ndarray | None = None  # Frame when rotation started
+        # Center estimation during rotation
+        self._rotation_start_frame: np.ndarray | None = None
         self._center_estimates: list[tuple[float, float, float]] = []  # (cx, cy, weight)
-        self._min_angle_for_center: float = 3.0  # Minimum cumulative angle for reliable center estimate
-        self._center_update_interval: int = 10  # Frames between center updates
+        self._min_angle_for_center: float = 3.0
+        self._center_update_interval: int = 10
         self._frames_since_center_update: int = 0
+
+        # Background cache
+        self._cached_background: np.ndarray | None = None
+        self._cache_valid: bool = False
 
     def initialize(
         self,
@@ -279,48 +355,14 @@ class AdaptiveBackgroundManager:
         initial_center_estimate: tuple[float, float] | None = None,
     ) -> None:
         """
-        Initialize the manager: compute initial static background.
+        Initialize the manager.
 
         Args:
-            max_frames: Limit frames for background sampling
+            max_frames: Unused (kept for API compatibility)
             initial_center_estimate: Optional hint for rotation center
         """
         self._rotation_center = initial_center_estimate
-        self._static_background = self._compute_initial_background(max_frames)
-        self._reference_background = self._static_background.copy()
-
-    def _compute_initial_background(
-        self,
-        max_frames: int | None = None,
-    ) -> np.ndarray:
-        """Compute initial background from video start."""
-        cap = cv2.VideoCapture(self.video_path)
-        if not cap.isOpened():
-            raise ValueError(f"Unable to open video: {self.video_path}")
-
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
-        if total_frames <= 0:
-            cap.release()
-            raise ValueError("Video has no frames")
-
-        frames_to_use = min(total_frames, max_frames) if max_frames else total_frames
-        indices = np.linspace(0, min(frames_to_use - 1, 100), self.initial_bg_samples).astype(int)
-
-        samples = []
-        for idx in indices:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
-            ret, frame = cap.read()
-            if ret:
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                samples.append(gray.astype(np.float32))
-
-        cap.release()
-
-        if not samples:
-            raise ValueError("No frames available to compute background")
-
-        background = np.median(samples, axis=0).astype(np.uint8)
-        return background
+        # Buffer will be filled as frames are processed
 
     def get_background(
         self,
@@ -343,31 +385,112 @@ class AdaptiveBackgroundManager:
         else:
             gray = frame
 
-        # First frame initialization
+        if self._frame_shape is None:
+            self._frame_shape = gray.shape[:2]
+
+        # First frame: add to buffer and return frame itself
         if self._prev_frame is None:
             self._prev_frame = gray.copy()
-            return self._static_background
+            self._add_frame_to_buffer(gray, frame_idx)
+            return gray  # No background yet
 
-        # Estimate rotation
+        # Estimate rotation between consecutive frames
         rotation_estimate = self.estimator.estimate(self._prev_frame, gray)
 
         # Update state machine
         self._update_state(frame_idx, gray, rotation_estimate)
 
+        # Add current frame to buffer
+        self._add_frame_to_buffer(gray, frame_idx)
+
         # Store current frame for next iteration
         self._prev_frame = gray.copy()
 
-        # Return appropriate background based on state
+        # Compute and return background
+        return self._compute_background()
+
+    def _add_frame_to_buffer(self, frame: np.ndarray, frame_idx: int) -> None:
+        """Add frame to rolling buffer with current cumulative rotation."""
+        buffered = BufferedFrame(
+            frame=frame.copy(),
+            frame_idx=frame_idx,
+            cumulative_rotation=self._cumulative_rotation_deg,
+        )
+        self._frame_buffer.append(buffered)
+        self._cache_valid = False
+
+    def _compute_background(self) -> np.ndarray:
+        """
+        Compute background from buffered frames.
+
+        In STATIC mode: simple median of buffered frames.
+        In ROTATING mode: align each buffered frame to current orientation, then median.
+        """
+        if not self._frame_buffer:
+            raise ValueError("No frames in buffer")
+
+        if self._cache_valid and self._cached_background is not None:
+            return self._cached_background
+
         if self._state == RotationState.STATIC:
-            return self._static_background
+            # Simple median without rotation alignment
+            frames = np.array([bf.frame.astype(np.float32) for bf in self._frame_buffer])
+            self._cached_background = np.median(frames, axis=0).astype(np.uint8)
 
-        elif self._state == RotationState.ROTATING:
-            # Rotate reference background by cumulative angle
-            return self._rotate_background(self._cumulative_rotation_deg)
+        else:  # ROTATING or TRANSITION
+            # Align each buffered frame to current orientation
+            aligned_frames = []
+            current_rotation = self._cumulative_rotation_deg
 
-        else:  # TRANSITION
-            # Use last rotated background while collecting frames
-            return self._rotate_background(self._cumulative_rotation_deg)
+            for bf in self._frame_buffer:
+                # How much to rotate this frame to align with current
+                rotation_offset = current_rotation - bf.cumulative_rotation
+
+                if abs(rotation_offset) < 0.01:
+                    # No rotation needed
+                    aligned_frames.append(bf.frame.astype(np.float32))
+                else:
+                    # Rotate frame to align
+                    aligned = self._rotate_frame(bf.frame, rotation_offset)
+                    aligned_frames.append(aligned.astype(np.float32))
+
+            frames = np.array(aligned_frames)
+            self._cached_background = np.median(frames, axis=0).astype(np.uint8)
+
+        self._cache_valid = True
+        return self._cached_background
+
+    def _rotate_frame(self, frame: np.ndarray, angle_deg: float) -> np.ndarray:
+        """
+        Rotate a frame by specified angle.
+
+        Args:
+            frame: Grayscale frame to rotate
+            angle_deg: Rotation angle in degrees (positive = clockwise)
+
+        Returns:
+            Rotated frame
+        """
+        h, w = frame.shape[:2]
+
+        # Use estimated center or frame center
+        if self._rotation_center is not None:
+            center = self._rotation_center
+        else:
+            center = (w / 2.0, h / 2.0)
+
+        # OpenCV uses counter-clockwise rotation, so negate angle
+        M = cv2.getRotationMatrix2D(center, -angle_deg, 1.0)
+
+        rotated = cv2.warpAffine(
+            frame,
+            M,
+            (w, h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REPLICATE,
+        )
+
+        return rotated
 
     def _update_state(
         self,
@@ -396,12 +519,13 @@ class AdaptiveBackgroundManager:
         elif self._state == RotationState.ROTATING:
             # Accumulate rotation
             self._cumulative_rotation_deg += smoothed_angle
+            self._cache_valid = False  # Alignment changes each frame
 
             # Update current episode
             if self._current_episode is not None:
                 self._current_episode.total_rotation_deg = self._cumulative_rotation_deg
 
-            # Periodically update center estimate using start frame comparison
+            # Periodically update center estimate
             self._frames_since_center_update += 1
             if (self._frames_since_center_update >= self._center_update_interval and
                 abs(self._cumulative_rotation_deg) >= self._min_angle_for_center):
@@ -417,7 +541,11 @@ class AdaptiveBackgroundManager:
                 self._low_rotation_count = 0
 
         elif self._state == RotationState.TRANSITION:
-            # Collect frames for new background
+            # Continue accumulating rotation during transition
+            self._cumulative_rotation_deg += smoothed_angle
+            self._cache_valid = False
+
+            # Collect frames for transition
             self._transition_frames.append(frame.copy())
 
             if len(self._transition_frames) >= self.transition_bg_frames:
@@ -426,13 +554,24 @@ class AdaptiveBackgroundManager:
     def _enter_rotating_state(self, frame_idx: int) -> None:
         """Transition from STATIC to ROTATING."""
         self._state = RotationState.ROTATING
-        self._reference_background = self._static_background.copy()
         self._cumulative_rotation_deg = 0.0
         self._low_rotation_count = 0
         self._center_estimates = []
         self._frames_since_center_update = 0
+        self._cache_valid = False
 
-        # Save the start frame for center estimation
+        # Reset cumulative rotation for all buffered frames
+        # (they're all at the same orientation when rotation starts)
+        new_buffer = deque(maxlen=self.buffer_size)
+        for bf in self._frame_buffer:
+            new_buffer.append(BufferedFrame(
+                frame=bf.frame,
+                frame_idx=bf.frame_idx,
+                cumulative_rotation=0.0,
+            ))
+        self._frame_buffer = new_buffer
+
+        # Save start frame for center estimation
         if self._prev_frame is not None:
             self._rotation_start_frame = self._prev_frame.copy()
 
@@ -442,33 +581,22 @@ class AdaptiveBackgroundManager:
         print(f"[AdaptiveBG] Rotation detected at frame {frame_idx}")
 
     def _update_center_from_start_frame(self, current_frame: np.ndarray) -> None:
-        """
-        Estimate rotation center by comparing start frame to current frame.
-
-        This uses the larger cumulative rotation angle for more stable estimation.
-        The center is weighted by the rotation angle magnitude.
-        """
+        """Estimate rotation center by comparing start frame to current."""
         if self._rotation_start_frame is None:
             return
 
-        # Estimate rotation from start frame to current frame
         estimate = self.estimator.estimate(self._rotation_start_frame, current_frame)
 
         if estimate is None:
             return
 
-        # Only use estimates where the angle is significant (more reliable)
         if abs(estimate.angle_deg) < self._min_angle_for_center:
             return
 
-        # Weight by angle magnitude - larger angles give more reliable centers
         weight = abs(estimate.angle_deg) * estimate.confidence
-
-        # Store weighted estimate
         self._center_estimates.append((estimate.center[0], estimate.center[1], weight))
-
-        # Compute weighted average and update rotation center
         self._rotation_center = self._compute_weighted_center()
+        self._cache_valid = False
 
     def _compute_weighted_center(self) -> tuple[float, float] | None:
         """Compute weighted average of center estimates."""
@@ -489,16 +617,14 @@ class AdaptiveBackgroundManager:
         self._state = RotationState.TRANSITION
         self._transition_frames = []
 
-        # Finalize rotation center estimate using weighted average
+        # Finalize center estimate
         if self._center_estimates:
             self._rotation_center = self._compute_weighted_center()
-
-            # Log center estimate quality
             n_estimates = len(self._center_estimates)
             total_weight = sum(w for _, _, w in self._center_estimates)
-            print(f"[AdaptiveBG] Center estimated from {n_estimates} samples, total weight: {total_weight:.1f}")
+            print(f"[AdaptiveBG] Center estimated from {n_estimates} samples, weight: {total_weight:.1f}")
 
-        # Finalize current episode
+        # Finalize episode
         if self._current_episode is not None:
             self._current_episode.end_frame = frame_idx
             self._current_episode.rotation_center = self._rotation_center or (0, 0)
@@ -511,57 +637,29 @@ class AdaptiveBackgroundManager:
             self._current_episode = None
 
         print(f"[AdaptiveBG] Rotation stopped at frame {frame_idx}, "
-              f"total rotation: {self._cumulative_rotation_deg:.1f} deg, "
+              f"total: {self._cumulative_rotation_deg:.1f} deg, "
               f"center: {self._rotation_center}")
 
     def _complete_transition(self) -> None:
-        """Complete transition: compute new static background."""
-        # Compute new background from collected frames
-        samples = [f.astype(np.float32) for f in self._transition_frames]
-        self._static_background = np.median(samples, axis=0).astype(np.uint8)
-        self._reference_background = self._static_background.copy()
+        """Complete transition: reset buffer with transition frames."""
+        # Clear buffer and add transition frames
+        self._frame_buffer.clear()
+        start_idx = max(0, len(self._transition_frames) - self.buffer_size)
+        for i, frame in enumerate(self._transition_frames[start_idx:]):
+            self._frame_buffer.append(BufferedFrame(
+                frame=frame,
+                frame_idx=-1,  # Unknown original index
+                cumulative_rotation=0.0,
+            ))
 
         # Reset state
         self._state = RotationState.STATIC
         self._transition_frames = []
         self._cumulative_rotation_deg = 0.0
         self._angle_history.clear()
+        self._cache_valid = False
 
-        print("[AdaptiveBG] New static background computed, returning to STATIC state")
-
-    def _rotate_background(self, angle_deg: float) -> np.ndarray:
-        """
-        Rotate reference background by specified angle.
-
-        Args:
-            angle_deg: Rotation angle in degrees (positive = clockwise)
-
-        Returns:
-            Rotated background image
-        """
-        if self._reference_background is None:
-            raise ValueError("Reference background not initialized")
-
-        h, w = self._reference_background.shape[:2]
-
-        # Use estimated center or frame center
-        if self._rotation_center is not None:
-            center = self._rotation_center
-        else:
-            center = (w / 2.0, h / 2.0)
-
-        # OpenCV uses counter-clockwise rotation, so negate angle
-        M = cv2.getRotationMatrix2D(center, -angle_deg, 1.0)
-
-        rotated = cv2.warpAffine(
-            self._reference_background,
-            M,
-            (w, h),
-            flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_REPLICATE,
-        )
-
-        return rotated
+        print("[AdaptiveBG] Transition complete, returning to STATIC state")
 
     def get_state(self) -> RotationState:
         """Get current state."""
@@ -605,14 +703,20 @@ class AdaptiveBackgroundManager:
         """Get total weight of center estimates."""
         return sum(w for _, _, w in self._center_estimates)
 
+    def get_buffer_fill(self) -> tuple[int, int]:
+        """Get buffer fill (current, max)."""
+        return len(self._frame_buffer), self.buffer_size
+
 
 def visualize_adaptive_background(
     video_path: str,
     output_path: str,
     max_frames: int | None = None,
+    # Buffer parameters
+    buffer_size: int = 10,
     # Adaptive background parameters
-    rotation_start_threshold_deg: float = 0.5,
-    rotation_stop_threshold_deg: float = 0.1,
+    rotation_start_threshold_deg: float = 0.01,
+    rotation_stop_threshold_deg: float = 0.005,
     rotation_center: tuple[float, float] | None = None,
     # Visualization options
     diff_threshold: int = 10,
@@ -627,12 +731,14 @@ def visualize_adaptive_background(
     - Per-frame rotation angle (raw and smoothed)
     - Cumulative rotation
     - Estimated rotation center
+    - Buffer fill status
     - Feature matches (optional)
 
     Args:
         video_path: Path to input video
         output_path: Path for output diagnostic video
         max_frames: Maximum frames to process (None for all)
+        buffer_size: Number of recent frames to use for background (default 10)
         rotation_start_threshold_deg: Threshold to trigger rotation detection
         rotation_stop_threshold_deg: Threshold to consider rotation stopped
         rotation_center: Fixed rotation center, or None for auto-detect
@@ -652,9 +758,10 @@ def visualize_adaptive_background(
         max_frames = total_frames
 
     # Create adaptive background manager
-    print("Initializing adaptive background manager for visualization...")
+    print(f"Initializing adaptive background manager for visualization (buffer_size={buffer_size})...")
     manager = AdaptiveBackgroundManager(
         video_path,
+        buffer_size=buffer_size,
         rotation_start_threshold_deg=rotation_start_threshold_deg,
         rotation_stop_threshold_deg=rotation_stop_threshold_deg,
     )
@@ -692,6 +799,11 @@ def visualize_adaptive_background(
         RotationState.ROTATING: (0, 165, 255),  # Orange
         RotationState.TRANSITION: (255, 0, 255), # Magenta
     }
+    ROI_COLOR = (128, 128, 128)  # Gray
+
+    # ROI circle parameters
+    roi_center = (width // 2, height // 2)
+    roi_radius = min(width, height) // 2
 
     # History for plotting
     angle_plot_history = []
@@ -737,6 +849,9 @@ def visualize_adaptive_background(
                           cv2.MARKER_CROSS, 20, 2)
             cv2.circle(panel1, (cx, cy), 5, (0, 0, 255), -1)
 
+        # Draw ROI circle on panel 1
+        cv2.circle(panel1, roi_center, roi_radius, ROI_COLOR, 1)
+
         # Panel 2: Current background
         panel2 = cv2.cvtColor(background, cv2.COLOR_GRAY2BGR)
         cv2.putText(panel2, "Background", (10, 25),
@@ -748,6 +863,9 @@ def visualize_adaptive_background(
             cv2.drawMarker(panel2, (cx, cy), (0, 0, 255),
                           cv2.MARKER_CROSS, 20, 2)
 
+        # Draw ROI circle on panel 2
+        cv2.circle(panel2, roi_center, roi_radius, ROI_COLOR, 1)
+
         # Panel 3: Difference/mask
         # Show diff with mask overlay
         diff_normalized = cv2.normalize(diff, None, 0, 255, cv2.NORM_MINMAX)
@@ -756,6 +874,9 @@ def visualize_adaptive_background(
         panel3[mask > 0] = [0, 0, 255]
         cv2.putText(panel3, f"Diff (thresh={diff_threshold})", (10, 25),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+        # Draw ROI circle on panel 3
+        cv2.circle(panel3, roi_center, roi_radius, ROI_COLOR, 1)
 
         # Combine top row
         top_row = np.hstack([panel1, panel2, panel3])
@@ -787,6 +908,11 @@ def visualize_adaptive_background(
         if rotation_center_est is not None:
             cv2.putText(info_panel, f"Center: ({rotation_center_est[0]:.0f}, {rotation_center_est[1]:.0f})",
                         (350, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
+
+        # Buffer fill info
+        buf_curr, buf_max = manager.get_buffer_fill()
+        cv2.putText(info_panel, f"Buffer: {buf_curr}/{buf_max}",
+                    (220, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
 
         # State-specific info
         if state == RotationState.ROTATING:

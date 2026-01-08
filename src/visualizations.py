@@ -2,6 +2,9 @@ import cv2
 import numpy as np
 import zarr
 
+from src.tracking import get_roi_params, create_circular_roi_mask
+from src.adaptive_background import RollingBackgroundManager
+
 
 def save_two_pass_labeled_video(
     video_path: str,
@@ -12,6 +15,7 @@ def save_two_pass_labeled_video(
     show_bulb_com: bool = True,
     background_mode: str = "original",
     diff_threshold: int = 10,
+    background_buffer_size: int = 10,
 ):
     """
     Save a labeled video with two-pass tracking annotations (mouth + bulbs).
@@ -25,9 +29,10 @@ def save_two_pass_labeled_video(
         show_bulb_com: Show bulb center of mass marker
         background_mode: What to display as background:
             - "original": Original video frames (default)
-            - "diff": Background subtraction difference image (grayscale)
-            - "mask": Binary mask after thresholding
+            - "diff": Background subtraction difference image (uses rolling median)
+            - "mask": Binary mask after thresholding (uses rolling median)
         diff_threshold: Threshold value for binary mask (only used when background_mode="mask")
+        background_buffer_size: Number of recent frames for rolling background (default 10)
     """
     root = zarr.open_group(zarr_path, mode='r')
 
@@ -60,19 +65,13 @@ def save_two_pass_labeled_video(
     fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    # Compute background if needed for diff or mask mode
-    gray_bg = None
+    # Initialize rolling background manager if needed for diff or mask mode
+    bg_manager = None
+    roi_mask = None
     if background_mode in ("diff", "mask"):
-        print("Computing background for visualization...")
-        frame_indices_bg = np.linspace(0, total_frames - 1, 20).astype(int)
-        bg_frames = []
-        for idx in frame_indices_bg:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-            ret, frame = cap.read()
-            if ret:
-                bg_frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32))
-        gray_bg = np.median(bg_frames, axis=0).astype(np.uint8)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Reset to start
+        print(f"Initializing rolling background (buffer_size={background_buffer_size})...")
+        bg_manager = RollingBackgroundManager(buffer_size=background_buffer_size)
+        roi_mask = create_circular_roi_mask(height, width)
 
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # type: ignore
     out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
@@ -86,6 +85,10 @@ def save_two_pass_labeled_video(
     BULB_COLOR = (255, 200, 0)   # Cyan (BGR)
     COM_COLOR = (0, 255, 255)    # Yellow (BGR)
     DIRECTION_COLOR = (0, 255, 0)  # Green (BGR)
+    ROI_COLOR = (128, 128, 128)  # Gray (BGR)
+
+    # Get ROI circle parameters
+    roi_center, roi_radius = get_roi_params(height, width)
 
     if max_frames is None:
         max_frames = n_frames
@@ -95,18 +98,24 @@ def save_two_pass_labeled_video(
         if not ret:
             break
 
-        # Apply background mode transformation
-        if background_mode == "diff" and gray_bg is not None:
+        # Apply background mode transformation using rolling background
+        if background_mode in ("diff", "mask") and bg_manager is not None:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            diff = cv2.absdiff(gray, gray_bg)
-            # Scale diff to use full dynamic range for better visibility
-            diff_scaled = cv2.normalize(diff, None, 0, 255, cv2.NORM_MINMAX)
-            frame = cv2.cvtColor(diff_scaled, cv2.COLOR_GRAY2BGR)
-        elif background_mode == "mask" and gray_bg is not None:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            diff = cv2.absdiff(gray, gray_bg)
-            _, mask = cv2.threshold(diff, diff_threshold, 255, cv2.THRESH_BINARY)
-            frame = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+            bg_manager.update(gray)
+
+            if bg_manager.is_ready():
+                gray_bg = bg_manager.get_background()
+                diff = cv2.absdiff(gray, gray_bg)
+
+                if background_mode == "diff":
+                    # Scale diff to use full dynamic range for better visibility
+                    diff_scaled = cv2.normalize(diff, None, 0, 255, cv2.NORM_MINMAX)
+                    frame = cv2.cvtColor(diff_scaled, cv2.COLOR_GRAY2BGR)
+                else:  # mask mode
+                    _, mask = cv2.threshold(diff, diff_threshold, 255, cv2.THRESH_BINARY)
+                    # Apply ROI mask to match what tracking sees
+                    mask = cv2.bitwise_and(mask, roi_mask)
+                    frame = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
 
         # Draw bulb tracks (smaller circles, cyan)
         for track_idx in range(n_bulb_tracks):
@@ -158,6 +167,9 @@ def save_two_pass_labeled_video(
                 # Draw arrow from CoM to mouth
                 cv2.arrowedLine(frame, (com_x, com_y), (mouth_px, mouth_py),
                                DIRECTION_COLOR, 2, tipLength=0.15)
+
+        # Draw ROI circle boundary
+        cv2.circle(frame, roi_center, roi_radius, ROI_COLOR, 1)
 
         out.write(frame)
 
