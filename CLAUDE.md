@@ -52,7 +52,9 @@ Important parameters:
 - `adaptive_background`: Enable rotation compensation
 - `rotation_start_threshold_deg`: Degrees/frame to trigger rotation detection
 - `mouth_min_area`/`mouth_max_area`: Pixel area bounds for mouth detection
+- `mouth_search_radius`: Max distance (pixels) from last known position to search for mouth and bulbs when mouth is lost (None = no limit). When `adaptive_background=True` and rotation is detected, the search center rotates with the background.
 - `bulb_min_area`/`bulb_max_area`: Pixel area bounds for bulb detection
+- `bulb_search_radius`: Max distance (pixels) from mouth to consider bulbs when mouth is tracked (None = no limit)
 
 ### `merge_mouth_tracks()` in `src/tracking.py`
 Links non-overlapping mouth track segments. Call after `run_two_pass_tracking()`.
@@ -65,6 +67,11 @@ Creates annotated video. `background_mode` options:
 - `"original"`: Show original video
 - `"diff"`: Show background subtraction (uses same rolling background as tracking)
 - `"mask"`: Show binary mask with ROI applied
+
+Optional search radius visualization:
+- `bulb_search_radius`: Draws cyan circle around mouth showing bulb search area
+- `mouth_search_radius`: Draws orange circle when mouth is lost showing search area
+- `adaptive_background`: When enabled, the search area rotates with the background (matches tracking behavior)
 
 ### `visualize_adaptive_background()` in `src/adaptive_background.py`
 Diagnostic visualization showing state machine, rotation angles, and background alignment.

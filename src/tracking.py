@@ -4,6 +4,33 @@ from skimage.measure import label, regionprops
 from src.tracker import RobustTracker, TrackingData
 
 
+def rotate_point(point: tuple[float, float], angle_deg: float, center: tuple[float, float]) -> tuple[float, float]:
+    """
+    Rotate a point around a center by a given angle.
+
+    Args:
+        point: (x, y) coordinates to rotate
+        angle_deg: Rotation angle in degrees (positive = clockwise)
+        center: (cx, cy) center of rotation
+
+    Returns:
+        Rotated (x, y) coordinates
+    """
+    angle_rad = np.radians(angle_deg)
+    cos_a = np.cos(angle_rad)
+    sin_a = np.sin(angle_rad)
+
+    # Translate point to origin
+    px, py = point[0] - center[0], point[1] - center[1]
+
+    # Rotate (clockwise rotation)
+    rx = px * cos_a + py * sin_a
+    ry = -px * sin_a + py * cos_a
+
+    # Translate back
+    return (rx + center[0], ry + center[1])
+
+
 def create_circular_roi_mask(height: int, width: int) -> np.ndarray:
     """
     Create a circular region-of-interest mask.
@@ -223,11 +250,13 @@ def run_two_pass_tracking(
     mouth_max_area: int = 160,
     mouth_max_disappeared: int = 15,
     mouth_max_distance: int = 50,
+    mouth_search_radius: int | None = None,
     # Bulb (small object) parameters
     bulb_min_area: int = 5,
     bulb_max_area: int = 35,
     bulb_max_disappeared: int = 10,
     bulb_max_distance: int = 30,
+    bulb_search_radius: int | None = None,
     # Adaptive background parameters (for rotating backgrounds)
     adaptive_background: bool = False,
     rotation_start_threshold_deg: float = 0.01,
@@ -248,10 +277,13 @@ def run_two_pass_tracking(
         mouth_max_area: Maximum area for mouth detection
         mouth_max_disappeared: Max frames mouth can disappear
         mouth_max_distance: Max distance for mouth track association
+        mouth_search_radius: Max distance from last known position to search for mouth (None = no limit)
         bulb_min_area: Minimum area for bulb detection
         bulb_max_area: Maximum area for bulb detection
         bulb_max_disappeared: Max frames bulb can disappear
         bulb_max_distance: Max distance for bulb track association
+        bulb_search_radius: Max distance from mouth to consider bulbs when mouth is tracked (None = no limit).
+            When mouth is lost, mouth_search_radius is used for bulb filtering instead.
         adaptive_background: Enable rotation-compensated background subtraction
         rotation_start_threshold_deg: Degrees/frame to trigger rotation detection
         rotation_stop_threshold_deg: Degrees/frame to consider rotation stopped
@@ -270,7 +302,7 @@ def run_two_pass_tracking(
 
     # Initialize background manager
     if adaptive_background:
-        from src.adaptive_background import AdaptiveBackgroundManager
+        from src.adaptive_background import AdaptiveBackgroundManager, RotationState
 
         print(f"Initializing adaptive background manager (buffer_size={background_buffer_size})...")
         bg_manager = AdaptiveBackgroundManager(
@@ -299,6 +331,7 @@ def run_two_pass_tracking(
     print(f"ROI mask: circle at ({roi_center[0]}, {roi_center[1]}) with radius {roi_radius}")
 
     frame_idx = 0
+    last_mouth_position = None  # Track last known mouth position for search radius
 
     while True:
         ret, frame = cap.read()
@@ -328,12 +361,52 @@ def run_two_pass_tracking(
         # Apply circular ROI mask - only consider detections within the ROI
         mask = cv2.bitwise_and(mask, roi_mask)
 
+        # When adaptive background detects rotation, rotate the last known mouth position
+        # so the search area follows the rotation
+        if adaptive_background and last_mouth_position is not None:
+            if bg_manager.get_state() in (RotationState.ROTATING, RotationState.TRANSITION):
+                rotation_angle = bg_manager.get_last_smoothed_angle()
+                rotation_center_pt = bg_manager.get_rotation_center()
+                if rotation_center_pt is not None and abs(rotation_angle) > 0.001:
+                    last_mouth_position = rotate_point(last_mouth_position, rotation_angle, rotation_center_pt)
+
         # Detect mouth (larger objects)
         mouth_stats = detect_objects_with_stats(mask, min_area=mouth_min_area, max_area=mouth_max_area)
+
+        # Filter mouth detections by distance from last known position if enabled
+        if mouth_search_radius is not None and last_mouth_position is not None:
+            mouth_stats = [
+                m for m in mouth_stats
+                if np.linalg.norm(np.array(m['centroid']) - np.array(last_mouth_position)) <= mouth_search_radius
+            ]
+
         mouth_tracker.update(mouth_stats)
+
+        # Get current mouth position for spatial filtering of bulbs and update last known position
+        mouth_position = None
+        if mouth_tracker.objects:
+            # Use the first (and typically only) mouth object
+            first_mouth = next(iter(mouth_tracker.objects.values()))
+            mouth_position = first_mouth['centroid']
+            last_mouth_position = mouth_position  # Update last known position
 
         # Detect bulbs (smaller objects)
         bulb_stats = detect_objects_with_stats(mask, min_area=bulb_min_area, max_area=bulb_max_area)
+
+        # Filter bulbs by distance from mouth position
+        # - If mouth is tracked: use bulb_search_radius from current position
+        # - If mouth is lost: use mouth_search_radius from last known position
+        if mouth_position is not None and bulb_search_radius is not None:
+            bulb_stats = [
+                b for b in bulb_stats
+                if np.linalg.norm(np.array(b['centroid']) - np.array(mouth_position)) <= bulb_search_radius
+            ]
+        elif last_mouth_position is not None and mouth_search_radius is not None:
+            bulb_stats = [
+                b for b in bulb_stats
+                if np.linalg.norm(np.array(b['centroid']) - np.array(last_mouth_position)) <= mouth_search_radius
+            ]
+
         bulb_tracker.update(bulb_stats)
 
         frame_idx += 1
