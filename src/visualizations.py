@@ -2,8 +2,9 @@ import cv2
 import numpy as np
 import zarr
 
-from src.tracking import get_roi_params, create_circular_roi_mask, rotate_point
-from src.adaptive_background import RollingBackgroundManager, AdaptiveBackgroundManager, RotationState
+from src.tracking import get_roi_params
+from src.adaptive_background import BackgroundProcessor, RotationState
+from src.save_results import load_parameters_from_zarr
 
 
 def save_two_pass_labeled_video(
@@ -14,17 +15,21 @@ def save_two_pass_labeled_video(
     show_direction_vector: bool = True,
     show_bulb_com: bool = True,
     background_mode: str = "original",
-    diff_threshold: int = 10,
-    background_buffer_size: int = 10,
+    # Parameters below can be auto-loaded from zarr if not specified
+    diff_threshold: int | None = None,
+    background_buffer_size: int | None = None,
     bulb_search_radius: int | None = None,
     mouth_search_radius: int | None = None,
-    adaptive_background: bool = False,
-    rotation_start_threshold_deg: float = 0.01,
-    rotation_stop_threshold_deg: float = 0.005,
+    adaptive_background: bool | None = None,
+    rotation_start_threshold_deg: float | None = None,
+    rotation_stop_threshold_deg: float | None = None,
     rotation_center: tuple[float, float] | None = None,
 ):
     """
     Save a labeled video with two-pass tracking annotations (mouth + bulbs).
+
+    Parameters can be auto-loaded from zarr if saved during tracking. Explicitly
+    specified parameters override the loaded values.
 
     Args:
         video_path: Path to source video
@@ -37,16 +42,64 @@ def save_two_pass_labeled_video(
             - "original": Original video frames (default)
             - "diff": Background subtraction difference image (uses rolling median)
             - "mask": Binary mask after thresholding (uses rolling median)
-        diff_threshold: Threshold value for binary mask (only used when background_mode="mask")
-        background_buffer_size: Number of recent frames for rolling background (default 10)
+        diff_threshold: Threshold value for binary mask (None = load from zarr or default 10)
+        background_buffer_size: Number of recent frames for rolling background (None = load from zarr or default 10)
         bulb_search_radius: If set, draw circle showing bulb search area around mouth
         mouth_search_radius: If set, draw circle showing mouth search area when mouth is lost
-        adaptive_background: Enable rotation-compensated search area visualization
+        adaptive_background: Enable rotation-compensated search area visualization (None = load from zarr)
         rotation_start_threshold_deg: Degrees/frame to trigger rotation detection
         rotation_stop_threshold_deg: Degrees/frame to consider rotation stopped
         rotation_center: Fixed rotation center (cx, cy), or None for auto-detection
     """
     root = zarr.open_group(zarr_path, mode='r')
+
+    # Try to load parameters from zarr and merge with explicitly specified values
+    saved_params = load_parameters_from_zarr(zarr_path)
+    if saved_params is not None:
+        print("Loaded tracking parameters from zarr")
+
+    # Apply defaults: explicit args > saved params > hardcoded defaults
+    # Use local variables with guaranteed types
+    _threshold: int = (
+        diff_threshold if diff_threshold is not None
+        else saved_params.threshold if saved_params is not None
+        else 10
+    )
+    _buffer_size: int = (
+        background_buffer_size if background_buffer_size is not None
+        else saved_params.background_buffer_size if saved_params is not None
+        else 10
+    )
+    _bulb_search_radius: int | None = (
+        bulb_search_radius if bulb_search_radius is not None
+        else saved_params.bulb_search_radius if saved_params is not None
+        else None
+    )
+    _mouth_search_radius: int | None = (
+        mouth_search_radius if mouth_search_radius is not None
+        else saved_params.mouth_search_radius if saved_params is not None
+        else None
+    )
+    _adaptive_bg: bool = (
+        adaptive_background if adaptive_background is not None
+        else saved_params.adaptive_background if saved_params is not None
+        else False
+    )
+    _rotation_start: float = (
+        rotation_start_threshold_deg if rotation_start_threshold_deg is not None
+        else saved_params.rotation_start_threshold_deg if saved_params is not None
+        else 0.01
+    )
+    _rotation_stop: float = (
+        rotation_stop_threshold_deg if rotation_stop_threshold_deg is not None
+        else saved_params.rotation_stop_threshold_deg if saved_params is not None
+        else 0.005
+    )
+    _rotation_center: tuple[float, float] | None = (
+        rotation_center if rotation_center is not None
+        else saved_params.rotation_center if saved_params is not None
+        else None
+    )
 
     # Load mouth tracking data
     mouth_group = root['mouth']
@@ -77,28 +130,24 @@ def save_two_pass_labeled_video(
     fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    # Initialize background manager
-    bg_manager = None
-    adaptive_bg_manager = None
-    roi_mask = None
+    # Initialize background processor for diff/mask modes or adaptive background
+    bg_processor = None
+    need_bg_processor = background_mode in ("diff", "mask") or _adaptive_bg
 
-    if background_mode in ("diff", "mask"):
-        print(f"Initializing rolling background (buffer_size={background_buffer_size})...")
-        bg_manager = RollingBackgroundManager(buffer_size=background_buffer_size)
-        roi_mask = create_circular_roi_mask(height, width)
-
-    # Initialize adaptive background manager for rotation detection (used for search area rotation)
-    if adaptive_background:
-        print(f"Initializing adaptive background for rotation detection...")
-        adaptive_bg_manager = AdaptiveBackgroundManager(
-            video_path,
-            buffer_size=background_buffer_size,
-            rotation_start_threshold_deg=rotation_start_threshold_deg,
-            rotation_stop_threshold_deg=rotation_stop_threshold_deg,
-        )
-        adaptive_bg_manager.initialize(
+    if need_bg_processor:
+        bg_mode = "adaptive" if _adaptive_bg else "rolling"
+        print(f"Initializing {bg_mode} background processor (buffer_size={_buffer_size})...")
+        bg_processor = BackgroundProcessor(
+            video_path=video_path,
+            width=width,
+            height=height,
+            background_buffer_size=_buffer_size,
+            threshold=_threshold,
+            adaptive_background=_adaptive_bg,
+            rotation_start_threshold_deg=_rotation_start,
+            rotation_stop_threshold_deg=_rotation_stop,
+            rotation_center=_rotation_center,
             max_frames=max_frames,
-            initial_center_estimate=rotation_center,
         )
 
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # type: ignore
@@ -133,34 +182,25 @@ def save_two_pass_labeled_video(
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        # Apply background mode transformation using rolling background
-        if background_mode in ("diff", "mask") and bg_manager is not None:
-            bg_manager.update(gray)
+        # Process frame through background processor
+        if bg_processor is not None:
+            diff, mask, is_ready = bg_processor.process_frame(frame_idx, gray)
 
-            if bg_manager.is_ready():
-                gray_bg = bg_manager.get_background()
-                diff = cv2.absdiff(gray, gray_bg)
-
+            # Apply background mode transformation
+            if background_mode in ("diff", "mask") and is_ready:
                 if background_mode == "diff":
                     # Scale diff to use full dynamic range for better visibility
-                    diff_scaled = cv2.normalize(diff, None, 0, 255, cv2.NORM_MINMAX)
+                    diff_scaled = np.zeros_like(diff)
+                    cv2.normalize(diff, diff_scaled, 0, 255, cv2.NORM_MINMAX)
                     frame = cv2.cvtColor(diff_scaled, cv2.COLOR_GRAY2BGR)
                 else:  # mask mode
-                    _, mask = cv2.threshold(diff, diff_threshold, 255, cv2.THRESH_BINARY)
-                    # Apply ROI mask to match what tracking sees
-                    mask = cv2.bitwise_and(mask, roi_mask)
                     frame = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
 
-        # Update adaptive background manager and rotate search position if rotation detected
-        if adaptive_bg_manager is not None:
-            adaptive_bg_manager.get_background(frame_idx, gray)  # Updates rotation state
+            # Rotate search position if rotation detected
             if last_mouth_position is not None:
-                if adaptive_bg_manager.get_state() in (RotationState.ROTATING, RotationState.TRANSITION):
-                    rotation_angle = adaptive_bg_manager.get_last_smoothed_angle()
-                    rotation_center_pt = adaptive_bg_manager.get_rotation_center()
-                    if rotation_center_pt is not None and abs(rotation_angle) > 0.001:
-                        last_mouth_position = rotate_point(last_mouth_position, rotation_angle, rotation_center_pt)
-                        last_mouth_position = (int(last_mouth_position[0]), int(last_mouth_position[1]))
+                rotated = bg_processor.rotate_point_if_needed(last_mouth_position)
+                if rotated is not None:
+                    last_mouth_position = (int(rotated[0]), int(rotated[1]))
 
         # Draw bulb tracks (smaller circles, cyan)
         for track_idx in range(n_bulb_tracks):
@@ -208,13 +248,13 @@ def save_two_pass_labeled_video(
         if current_mouth_position is not None:
             last_mouth_position = current_mouth_position
             # Draw bulb search radius around current mouth position
-            if bulb_search_radius is not None:
-                cv2.circle(frame, current_mouth_position, bulb_search_radius, BULB_SEARCH_COLOR, 1)
-        elif last_mouth_position is not None and mouth_search_radius is not None:
+            if _bulb_search_radius is not None:
+                cv2.circle(frame, current_mouth_position, _bulb_search_radius, BULB_SEARCH_COLOR, 1)
+        elif last_mouth_position is not None and _mouth_search_radius is not None:
             # Mouth is lost - draw search radius around last known position
             # This area is used for both mouth and bulb search
-            cv2.circle(frame, last_mouth_position, mouth_search_radius, MOUTH_SEARCH_COLOR, 2)
-            cv2.putText(frame, "Search area", (last_mouth_position[0] - 35, last_mouth_position[1] - mouth_search_radius - 5),
+            cv2.circle(frame, last_mouth_position, _mouth_search_radius, MOUTH_SEARCH_COLOR, 2)
+            cv2.putText(frame, "Search area", (last_mouth_position[0] - 35, last_mouth_position[1] - _mouth_search_radius - 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, MOUTH_SEARCH_COLOR, 1)
 
         # Draw direction vector from bulb CoM to mouth

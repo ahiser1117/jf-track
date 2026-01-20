@@ -1,7 +1,8 @@
 import cv2
 import numpy as np
 from skimage.measure import label, regionprops
-from src.tracker import RobustTracker, TrackingData
+from src.tracker import RobustTracker, TrackingData, TrackingParameters
+from src.adaptive_background import BackgroundProcessor
 
 
 def rotate_point(point: tuple[float, float], angle_deg: float, center: tuple[float, float]) -> tuple[float, float]:
@@ -23,9 +24,9 @@ def rotate_point(point: tuple[float, float], angle_deg: float, center: tuple[flo
     # Translate point to origin
     px, py = point[0] - center[0], point[1] - center[1]
 
-    # Rotate (clockwise rotation)
-    rx = px * cos_a + py * sin_a
-    ry = -px * sin_a + py * cos_a
+    # Rotate (clockwise rotation in screen coordinates where y points down)
+    rx = px * cos_a - py * sin_a
+    ry = px * sin_a + py * cos_a
 
     # Translate back
     return (rx + center[0], ry + center[1])
@@ -48,7 +49,7 @@ def create_circular_roi_mask(height: int, width: int) -> np.ndarray:
     mask = np.zeros((height, width), dtype=np.uint8)
     center = (width // 2, height // 2)
     radius = min(width, height) // 2
-    cv2.circle(mask, center, radius, 255, -1)
+    cv2.circle(mask, center, radius, (255,), -1)
     return mask
 
 
@@ -262,7 +263,7 @@ def run_two_pass_tracking(
     rotation_start_threshold_deg: float = 0.01,
     rotation_stop_threshold_deg: float = 0.005,
     rotation_center: tuple[float, float] | None = None,
-) -> tuple[TrackingData, TrackingData, float]:
+) -> tuple[TrackingData, TrackingData, float, TrackingParameters]:
     """
     Run two-pass tracking: first for the mouth (larger object), then for bulbs (smaller objects).
 
@@ -293,41 +294,55 @@ def run_two_pass_tracking(
         mouth_tracking: TrackingData for the mouth
         bulb_tracking: TrackingData for the bulbs
         fps: Video frame rate
+        parameters: TrackingParameters used for this run
     """
+    # Build tracking parameters
+    params = TrackingParameters(
+        background_buffer_size=background_buffer_size,
+        threshold=threshold,
+        mouth_min_area=mouth_min_area,
+        mouth_max_area=mouth_max_area,
+        mouth_max_disappeared=mouth_max_disappeared,
+        mouth_max_distance=mouth_max_distance,
+        mouth_search_radius=mouth_search_radius,
+        bulb_min_area=bulb_min_area,
+        bulb_max_area=bulb_max_area,
+        bulb_max_disappeared=bulb_max_disappeared,
+        bulb_max_distance=bulb_max_distance,
+        bulb_search_radius=bulb_search_radius,
+        adaptive_background=adaptive_background,
+        rotation_start_threshold_deg=rotation_start_threshold_deg,
+        rotation_stop_threshold_deg=rotation_stop_threshold_deg,
+        rotation_center=rotation_center,
+    )
+
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
 
     mouth_tracker = RobustTracker(max_disappeared=mouth_max_disappeared, max_distance=mouth_max_distance)
     bulb_tracker = RobustTracker(max_disappeared=bulb_max_disappeared, max_distance=bulb_max_distance)
 
-    # Initialize background manager
-    if adaptive_background:
-        from src.adaptive_background import AdaptiveBackgroundManager, RotationState
-
-        print(f"Initializing adaptive background manager (buffer_size={background_buffer_size})...")
-        bg_manager = AdaptiveBackgroundManager(
-            video_path,
-            buffer_size=background_buffer_size,
-            rotation_start_threshold_deg=rotation_start_threshold_deg,
-            rotation_stop_threshold_deg=rotation_stop_threshold_deg,
-        )
-        bg_manager.initialize(
-            max_frames=max_frames,
-            initial_center_estimate=rotation_center,
-        )
-    else:
-        from src.adaptive_background import RollingBackgroundManager
-
-        print(f"Initializing rolling background manager (buffer_size={background_buffer_size})...")
-        bg_manager = RollingBackgroundManager(buffer_size=background_buffer_size)
-
-    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Reset to start
-
-    # Create circular ROI mask (jellyfish expected within central circle)
+    # Get video dimensions
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    roi_mask = create_circular_roi_mask(frame_height, frame_width)
-    roi_center, roi_radius = get_roi_params(frame_height, frame_width)
+
+    # Initialize background processor (centralizes background subtraction logic)
+    bg_mode = "adaptive" if adaptive_background else "rolling"
+    print(f"Initializing {bg_mode} background processor (buffer_size={background_buffer_size})...")
+    bg_processor = BackgroundProcessor(
+        video_path=video_path,
+        width=frame_width,
+        height=frame_height,
+        background_buffer_size=background_buffer_size,
+        threshold=threshold,
+        adaptive_background=adaptive_background,
+        rotation_start_threshold_deg=rotation_start_threshold_deg,
+        rotation_stop_threshold_deg=rotation_stop_threshold_deg,
+        rotation_center=rotation_center,
+        max_frames=max_frames,
+    )
+
+    roi_center, roi_radius = bg_processor.get_roi_params()
     print(f"ROI mask: circle at ({roi_center[0]}, {roi_center[1]}) with radius {roi_radius}")
 
     frame_idx = 0
@@ -340,35 +355,18 @@ def run_two_pass_tracking(
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        # Get/update background
-        if adaptive_background:
-            gray_bg = bg_manager.get_background(frame_idx, gray)
-        else:
-            bg_manager.update(gray)
-            if not bg_manager.is_ready():
-                # Not enough frames yet, skip processing
-                frame_idx += 1
-                if frame_idx % 100 == 0:
-                    curr, total = bg_manager.buffer_fill()
-                    print(f"Filling background buffer: {curr}/{total}")
-                continue
-            gray_bg = bg_manager.get_background()
+        # Process frame through background subtraction
+        diff, mask, is_ready = bg_processor.process_frame(frame_idx, gray)
 
-        # Segmentation
-        diff = cv2.absdiff(gray, gray_bg)
-        _, mask = cv2.threshold(diff, threshold, 255, cv2.THRESH_BINARY)
+        if not is_ready:
+            # Not enough frames yet, skip processing
+            frame_idx += 1
+            if frame_idx % 100 == 0:
+                print(f"Filling background buffer...")
+            continue
 
-        # Apply circular ROI mask - only consider detections within the ROI
-        mask = cv2.bitwise_and(mask, roi_mask)
-
-        # When adaptive background detects rotation, rotate the last known mouth position
-        # so the search area follows the rotation
-        if adaptive_background and last_mouth_position is not None:
-            if bg_manager.get_state() in (RotationState.ROTATING, RotationState.TRANSITION):
-                rotation_angle = bg_manager.get_last_smoothed_angle()
-                rotation_center_pt = bg_manager.get_rotation_center()
-                if rotation_center_pt is not None and abs(rotation_angle) > 0.001:
-                    last_mouth_position = rotate_point(last_mouth_position, rotation_angle, rotation_center_pt)
+        # Rotate last mouth position if rotation is detected
+        last_mouth_position = bg_processor.rotate_point_if_needed(last_mouth_position)
 
         # Detect mouth (larger objects)
         mouth_stats = detect_objects_with_stats(mask, min_area=mouth_min_area, max_area=mouth_max_area)
@@ -420,13 +418,12 @@ def run_two_pass_tracking(
     cap.release()
 
     # Report rotation episodes if adaptive background was used
-    if adaptive_background:
-        episodes = bg_manager.get_rotation_episodes()
-        if episodes:
-            print(f"\nDetected {len(episodes)} rotation episode(s):")
-            for i, ep in enumerate(episodes):
-                print(f"  Episode {i+1}: frames {ep.start_frame}-{ep.end_frame}, "
-                      f"total rotation: {ep.total_rotation_deg:.1f} deg")
+    episodes = bg_processor.get_rotation_episodes()
+    if episodes:
+        print(f"\nDetected {len(episodes)} rotation episode(s):")
+        for i, ep in enumerate(episodes):
+            print(f"  Episode {i+1}: frames {ep.start_frame}-{ep.end_frame}, "
+                  f"total rotation: {ep.total_rotation_deg:.1f} deg")
 
     # Get data-oriented tracking results
     mouth_tracking = mouth_tracker.get_tracking_data()
@@ -435,7 +432,7 @@ def run_two_pass_tracking(
     print(f"Mouth tracking complete: {mouth_tracking.n_tracks} tracks, {mouth_tracking.n_frames} frames")
     print(f"Bulb tracking complete: {bulb_tracking.n_tracks} tracks, {bulb_tracking.n_frames} frames")
 
-    return mouth_tracking, bulb_tracking, fps
+    return mouth_tracking, bulb_tracking, fps, params
 
 
 def merge_mouth_tracks(mouth_tracking: TrackingData) -> TrackingData:

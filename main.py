@@ -15,7 +15,7 @@ if __name__ == "__main__":
 
     # Run two-pass tracking: mouth (large) + bulbs (small)
     print("=== Running Two-Pass Tracking ===")
-    mouth_tracking_raw, bulb_tracking, fps = run_two_pass_tracking(
+    mouth_tracking_raw, bulb_tracking, fps, tracking_params = run_two_pass_tracking(
         video_path,
         max_frames=frames_to_analyze,
         # Background buffer: uses rolling average of last N frames
@@ -52,16 +52,18 @@ if __name__ == "__main__":
         smooth_window=5,    # Smooth positions over 5 frames to reduce flickering
     )
 
-    # Save all results to zarr
+    # Save all results to zarr (includes tracking parameters for later visualization)
     save_two_pass_tracking_to_zarr(
         mouth_tracking,
         bulb_tracking,
         direction_analysis,
         zarr_path,
         fps,
+        parameters=tracking_params,
     )
 
     # Save labeled visualization video
+    # Parameters are auto-loaded from zarr, so we only need to specify overrides
     print("\n=== Generating Label Visualization ===")
     output_video_path = f"{save_base_path}/labeled_video.mp4"
     save_two_pass_labeled_video(
@@ -72,12 +74,14 @@ if __name__ == "__main__":
         show_direction_vector=True,
         show_bulb_com=True,
         background_mode="original",
-        background_buffer_size=10,  # Match tracking buffer size
-        mouth_search_radius=200,
-        bulb_search_radius=150,
-        adaptive_background=True,
-        rotation_start_threshold_deg=0.02,
-        rotation_stop_threshold_deg=0.005,
+        # Parameters below are auto-loaded from zarr (saved during tracking)
+        # You can override them here if needed:
+        # background_buffer_size=10,
+        # mouth_search_radius=200,
+        # bulb_search_radius=150,
+        # adaptive_background=True,
+        # rotation_start_threshold_deg=0.02,
+        # rotation_stop_threshold_deg=0.005,
     )
 
     # output_video_path = f"{save_base_path}/labeled_video_diff.mp4"

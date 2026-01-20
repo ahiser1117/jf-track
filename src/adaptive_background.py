@@ -515,6 +515,13 @@ class AdaptiveBackgroundManager:
             # Check for rotation onset
             if abs(smoothed_angle) > self.rotation_start_threshold_deg:
                 self._enter_rotating_state(frame_idx)
+                # Accumulate the first frame's rotation immediately
+                # (so cumulative matches what rotate_point_if_needed will apply)
+                self._cumulative_rotation_deg += smoothed_angle
+                self._cache_valid = False
+                # Update episode tracking
+                if self._current_episode is not None:
+                    self._current_episode.total_rotation_deg = self._cumulative_rotation_deg
 
         elif self._state == RotationState.ROTATING:
             # Accumulate rotation
@@ -706,6 +713,214 @@ class AdaptiveBackgroundManager:
     def get_buffer_fill(self) -> tuple[int, int]:
         """Get buffer fill (current, max)."""
         return len(self._frame_buffer), self.buffer_size
+
+
+class BackgroundProcessor:
+    """
+    Centralized background processing for tracking and visualization.
+
+    This class unifies the background subtraction logic used in both
+    tracking and visualization, ensuring consistent behavior.
+
+    It handles:
+    - Rolling or adaptive background management
+    - Background subtraction and thresholding
+    - ROI mask application
+    - Search position rotation during rotation episodes
+    """
+
+    def __init__(
+        self,
+        video_path: str,
+        width: int,
+        height: int,
+        background_buffer_size: int = 10,
+        threshold: int = 10,
+        adaptive_background: bool = False,
+        rotation_start_threshold_deg: float = 0.01,
+        rotation_stop_threshold_deg: float = 0.005,
+        rotation_center: tuple[float, float] | None = None,
+        max_frames: int | None = None,
+    ):
+        """
+        Initialize the background processor.
+
+        Args:
+            video_path: Path to video file (required for AdaptiveBackgroundManager)
+            width: Frame width in pixels
+            height: Frame height in pixels
+            background_buffer_size: Number of recent frames for background
+            threshold: Binary threshold for background subtraction
+            adaptive_background: Enable rotation-compensated background
+            rotation_start_threshold_deg: Degrees/frame to trigger rotation detection
+            rotation_stop_threshold_deg: Degrees/frame to consider rotation stopped
+            rotation_center: Fixed rotation center (cx, cy), or None for auto-detection
+            max_frames: Maximum frames to process (for initialization)
+        """
+        self.threshold = threshold
+        self.adaptive_background = adaptive_background
+        self._width = width
+        self._height = height
+
+        # Create circular ROI mask
+        self._roi_mask = self._create_circular_roi_mask(height, width)
+        self._roi_center = (width // 2, height // 2)
+        self._roi_radius = min(width, height) // 2
+
+        # Initialize background manager (separate typed attributes to avoid union type issues)
+        self._adaptive_manager: AdaptiveBackgroundManager | None = None
+        self._rolling_manager: RollingBackgroundManager | None = None
+
+        if adaptive_background:
+            self._adaptive_manager = AdaptiveBackgroundManager(
+                video_path,
+                buffer_size=background_buffer_size,
+                rotation_start_threshold_deg=rotation_start_threshold_deg,
+                rotation_stop_threshold_deg=rotation_stop_threshold_deg,
+            )
+            self._adaptive_manager.initialize(
+                max_frames=max_frames,
+                initial_center_estimate=rotation_center,
+            )
+        else:
+            self._rolling_manager = RollingBackgroundManager(buffer_size=background_buffer_size)
+
+    @staticmethod
+    def _create_circular_roi_mask(height: int, width: int) -> np.ndarray:
+        """Create a circular region-of-interest mask."""
+        mask = np.zeros((height, width), dtype=np.uint8)
+        center = (width // 2, height // 2)
+        radius = min(width, height) // 2
+        cv2.circle(mask, center, radius, (255,), -1)
+        return mask
+
+    def process_frame(
+        self,
+        frame_idx: int,
+        gray: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, bool]:
+        """
+        Process a frame through background subtraction.
+
+        Args:
+            frame_idx: 0-based frame index
+            gray: Grayscale frame (uint8)
+
+        Returns:
+            diff: Background subtraction difference image
+            mask: Binary mask after thresholding and ROI application
+            is_ready: Whether background is ready for use
+        """
+        if self._adaptive_manager is not None:
+            gray_bg = self._adaptive_manager.get_background(frame_idx, gray)
+            is_ready = True  # Adaptive always has a background (even if just the first frame)
+        elif self._rolling_manager is not None:
+            self._rolling_manager.update(gray)
+            if not self._rolling_manager.is_ready():
+                # Return empty diff/mask when not ready
+                return (
+                    np.zeros_like(gray),
+                    np.zeros_like(gray),
+                    False,
+                )
+            gray_bg = self._rolling_manager.get_background()
+            is_ready = True
+        else:
+            raise RuntimeError("No background manager initialized")
+
+        # Background subtraction
+        diff = cv2.absdiff(gray, gray_bg)
+        _, mask = cv2.threshold(diff, self.threshold, 255, cv2.THRESH_BINARY)
+
+        # Apply circular ROI mask
+        mask = cv2.bitwise_and(mask, self._roi_mask)
+
+        return diff, mask, is_ready
+
+    def rotate_point_if_needed(
+        self,
+        point: tuple[float, float] | None,
+    ) -> tuple[float, float] | None:
+        """
+        Rotate a point if adaptive background detects rotation.
+
+        Use this to rotate search positions during rotation episodes so they
+        follow the rotating background.
+
+        Args:
+            point: (x, y) coordinates to potentially rotate, or None
+
+        Returns:
+            Rotated (x, y) if rotation is active and point is not None, else original point
+        """
+        if point is None:
+            return None
+
+        if self._adaptive_manager is None:
+            return point
+
+        state = self._adaptive_manager.get_state()
+        if state not in (RotationState.ROTATING, RotationState.TRANSITION):
+            return point
+
+        rotation_angle = self._adaptive_manager.get_last_smoothed_angle()
+        if abs(rotation_angle) < 0.001:
+            return point
+
+        rotation_center = self._adaptive_manager.get_rotation_center()
+
+        # Use frame center as fallback when rotation center not yet estimated
+        # (matches the fallback behavior in AdaptiveBackgroundManager._rotate_frame)
+        if rotation_center is None:
+            rotation_center = (self._width / 2.0, self._height / 2.0)
+
+        # Rotate point
+        angle_rad = np.radians(rotation_angle)
+        cos_a = np.cos(angle_rad)
+        sin_a = np.sin(angle_rad)
+
+        px, py = point[0] - rotation_center[0], point[1] - rotation_center[1]
+        rx = px * cos_a - py * sin_a
+        ry = px * sin_a + py * cos_a
+
+        return (rx + rotation_center[0], ry + rotation_center[1])
+
+    def get_state(self) -> RotationState:
+        """Get current rotation state (STATIC if not using adaptive background)."""
+        if self._adaptive_manager is not None:
+            return self._adaptive_manager.get_state()
+        return RotationState.STATIC
+
+    def get_rotation_center(self) -> tuple[float, float] | None:
+        """Get estimated rotation center (None if not using adaptive background)."""
+        if self._adaptive_manager is not None:
+            return self._adaptive_manager.get_rotation_center()
+        return None
+
+    def get_cumulative_rotation(self) -> float:
+        """Get cumulative rotation in degrees (0 if not using adaptive background)."""
+        if self._adaptive_manager is not None:
+            return self._adaptive_manager.get_cumulative_rotation()
+        return 0.0
+
+    def get_rotation_episodes(self) -> list[RotationEpisode]:
+        """Get rotation episodes (empty list if not using adaptive background)."""
+        if self._adaptive_manager is not None:
+            return self._adaptive_manager.get_rotation_episodes()
+        return []
+
+    def get_roi_params(self) -> tuple[tuple[int, int], int]:
+        """Get ROI circle parameters (center, radius)."""
+        return self._roi_center, self._roi_radius
+
+    def get_roi_mask(self) -> np.ndarray:
+        """Get the ROI mask array."""
+        return self._roi_mask
+
+    @property
+    def is_adaptive(self) -> bool:
+        """Check if using adaptive background."""
+        return self.adaptive_background
 
 
 def visualize_adaptive_background(

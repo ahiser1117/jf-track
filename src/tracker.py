@@ -1,6 +1,64 @@
+import json
 import numpy as np
 from scipy.optimize import linear_sum_assignment
-from dataclasses import dataclass
+from dataclasses import dataclass, field, asdict
+
+
+@dataclass
+class TrackingParameters:
+    """
+    Parameters used for tracking, with serialization support.
+
+    This dataclass holds all configurable tracking parameters, allowing them
+    to be saved with tracking results and reused for visualization.
+    """
+    # Background subtraction
+    background_buffer_size: int = 10
+    threshold: int = 10
+
+    # Mouth detection
+    mouth_min_area: int = 35
+    mouth_max_area: int = 160
+    mouth_max_disappeared: int = 15
+    mouth_max_distance: int = 50
+    mouth_search_radius: int | None = None
+
+    # Bulb detection
+    bulb_min_area: int = 5
+    bulb_max_area: int = 35
+    bulb_max_disappeared: int = 10
+    bulb_max_distance: int = 30
+    bulb_search_radius: int | None = None
+
+    # Adaptive background
+    adaptive_background: bool = False
+    rotation_start_threshold_deg: float = 0.01
+    rotation_stop_threshold_deg: float = 0.005
+    rotation_center: tuple[float, float] | None = None
+
+    def to_dict(self) -> dict:
+        """Convert parameters to a JSON-serializable dictionary."""
+        d = asdict(self)
+        # rotation_center is already a tuple or None, which is JSON serializable
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict) -> 'TrackingParameters':
+        """Create TrackingParameters from a dictionary."""
+        # Handle rotation_center: convert list back to tuple if present
+        if 'rotation_center' in d and d['rotation_center'] is not None:
+            d = d.copy()
+            d['rotation_center'] = tuple(d['rotation_center'])
+        return cls(**d)
+
+    def to_json(self) -> str:
+        """Serialize parameters to JSON string."""
+        return json.dumps(self.to_dict())
+
+    @classmethod
+    def from_json(cls, json_str: str) -> 'TrackingParameters':
+        """Deserialize parameters from JSON string."""
+        return cls.from_dict(json.loads(json_str))
 
 
 @dataclass

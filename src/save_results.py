@@ -1,8 +1,30 @@
 import numpy as np
 import zarr
 
-from src.tracker import TrackingData
+from src.tracker import TrackingData, TrackingParameters
 from src.direction_analysis import DirectionAnalysis
+
+
+def load_parameters_from_zarr(zarr_path: str) -> TrackingParameters | None:
+    """
+    Load tracking parameters from a zarr store.
+
+    Args:
+        zarr_path: Path to zarr store
+
+    Returns:
+        TrackingParameters if found, None if the zarr doesn't have parameters
+        (e.g., older zarr files created before this feature)
+    """
+    try:
+        root = zarr.open_group(zarr_path, mode='r')
+        if 'parameters' in root.attrs:
+            params_dict = root.attrs['parameters']
+            if isinstance(params_dict, dict):
+                return TrackingParameters.from_dict(params_dict)
+        return None
+    except Exception:
+        return None
 
 
 def save_tracking_to_zarr(tracking_data: TrackingData, output_path: str, fps: float):
@@ -62,6 +84,7 @@ def save_two_pass_tracking_to_zarr(
     direction_analysis: DirectionAnalysis,
     output_path: str,
     fps: float,
+    parameters: TrackingParameters | None = None,
 ):
     """
     Save two-pass tracking data (mouth + bulbs) and direction analysis to zarr format.
@@ -72,6 +95,7 @@ def save_two_pass_tracking_to_zarr(
         direction_analysis: DirectionAnalysis with direction vectors
         output_path: Path to save zarr store
         fps: Video frame rate
+        parameters: Optional TrackingParameters to save with results
     """
     print(f"Saving two-pass tracking results to {output_path}...")
 
@@ -85,6 +109,10 @@ def save_two_pass_tracking_to_zarr(
     root.attrs['n_mouth_tracks'] = mouth_tracking.n_tracks
     root.attrs['n_bulb_tracks'] = bulb_tracking.n_tracks
     root.attrs['n_frames'] = n_frames
+
+    # Store tracking parameters if provided
+    if parameters is not None:
+        root.attrs['parameters'] = parameters.to_dict()
 
     def create_array_with_dims(name, data, dims):
         arr = root.create_array(name, data=data)
@@ -166,3 +194,5 @@ def save_two_pass_tracking_to_zarr(
 
     print(f"Saved mouth ({mouth_tracking.n_tracks} tracks) + bulbs ({bulb_tracking.n_tracks} tracks) x {n_frames} frames")
     print(f"Direction analysis included with {np.sum(~np.isnan(direction_analysis.direction_magnitude))} valid frames")
+    if parameters is not None:
+        print("Tracking parameters saved to zarr")
