@@ -2,10 +2,12 @@ import cv2
 import numpy as np
 from skimage.measure import label, regionprops
 from src.tracker import RobustTracker, TrackingData, TrackingParameters
-from src.adaptive_background import BackgroundProcessor
+from src.adaptive_background import BackgroundProcessor, RotationState
 
 
-def rotate_point(point: tuple[float, float], angle_deg: float, center: tuple[float, float]) -> tuple[float, float]:
+def rotate_point(
+    point: tuple[float, float], angle_deg: float, center: tuple[float, float]
+) -> tuple[float, float]:
     """
     Rotate a point around a center by a given angle.
 
@@ -70,6 +72,7 @@ def get_roi_params(height: int, width: int) -> tuple[tuple[int, int], int]:
 
 
 # --- Main Pipeline ---
+
 
 def compute_background(
     video_path: str,
@@ -159,12 +162,14 @@ def detect_objects_with_stats(
             # Major Axis Length (in pixels)
             major_axis = prop.axis_major_length
 
-            detections.append({
-                'centroid': (x, y),
-                'area': area,
-                'major_axis_length_mm': major_axis * pixel_size_mm,
-                'bounding_box': prop.bbox,  # (min_row, min_col, max_row, max_col)
-            })
+            detections.append(
+                {
+                    "centroid": (x, y),
+                    "area": area,
+                    "major_axis_length_mm": major_axis * pixel_size_mm,
+                    "bounding_box": prop.bbox,  # (min_row, min_col, max_row, max_col)
+                }
+            )
 
     return detections
 
@@ -202,7 +207,9 @@ def run_tracking(
 
     # Calculate background (median of sampled frames)
     print("Calculating background...")
-    background = compute_background(video_path, num_samples=background_samples, max_frames=max_frames)
+    background = compute_background(
+        video_path, num_samples=background_samples, max_frames=max_frames
+    )
     gray_bg = cv2.cvtColor(background, cv2.COLOR_BGR2GRAY)
 
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Reset to start
@@ -221,7 +228,9 @@ def run_tracking(
         diff = cv2.absdiff(gray, gray_bg)
         _, mask = cv2.threshold(diff, threshold, 255, cv2.THRESH_BINARY)
 
-        current_stats = detect_objects_with_stats(mask, min_area=min_area, max_area=max_area)
+        current_stats = detect_objects_with_stats(
+            mask, min_area=min_area, max_area=max_area
+        )
 
         # Update Tracker
         tracker.update(current_stats)
@@ -236,7 +245,9 @@ def run_tracking(
 
     # Get data-oriented tracking results
     tracking_data = tracker.get_tracking_data()
-    print(f"Tracking complete: {tracking_data.n_tracks} tracks, {tracking_data.n_frames} frames")
+    print(
+        f"Tracking complete: {tracking_data.n_tracks} tracks, {tracking_data.n_frames} frames"
+    )
 
     return tracking_data, fps
 
@@ -267,12 +278,13 @@ def run_two_pass_tracking(
     """
     Run two-pass tracking: first for the mouth (larger object), then for bulbs (smaller objects).
 
-    Uses a rolling buffer of recent frames for background computation.
+    Uses a per-episode background built from evenly spaced frames. When using
+    adaptive background, tracking is performed only during STATIC episodes.
 
     Args:
         video_path: Path to video file
         max_frames: Maximum number of frames to process (None for all)
-        background_buffer_size: Number of recent frames to use for background (default 10)
+        background_buffer_size: Number of frames sampled per episode for background (default 10)
         threshold: Binary threshold for background subtraction
         mouth_min_area: Minimum area for mouth detection
         mouth_max_area: Maximum area for mouth detection
@@ -319,8 +331,12 @@ def run_two_pass_tracking(
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
 
-    mouth_tracker = RobustTracker(max_disappeared=mouth_max_disappeared, max_distance=mouth_max_distance)
-    bulb_tracker = RobustTracker(max_disappeared=bulb_max_disappeared, max_distance=bulb_max_distance)
+    mouth_tracker = RobustTracker(
+        max_disappeared=mouth_max_disappeared, max_distance=mouth_max_distance
+    )
+    bulb_tracker = RobustTracker(
+        max_disappeared=bulb_max_disappeared, max_distance=bulb_max_distance
+    )
 
     # Get video dimensions
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -328,7 +344,9 @@ def run_two_pass_tracking(
 
     # Initialize background processor (centralizes background subtraction logic)
     bg_mode = "adaptive" if adaptive_background else "rolling"
-    print(f"Initializing {bg_mode} background processor (buffer_size={background_buffer_size})...")
+    print(
+        f"Initializing {bg_mode} background processor (buffer_size={background_buffer_size})..."
+    )
     bg_processor = BackgroundProcessor(
         video_path=video_path,
         width=frame_width,
@@ -343,10 +361,13 @@ def run_two_pass_tracking(
     )
 
     roi_center, roi_radius = bg_processor.get_roi_params()
-    print(f"ROI mask: circle at ({roi_center[0]}, {roi_center[1]}) with radius {roi_radius}")
+    print(
+        f"ROI mask: circle at ({roi_center[0]}, {roi_center[1]}) with radius {roi_radius}"
+    )
 
     frame_idx = 0
     last_mouth_position = None  # Track last known mouth position for search radius
+    prev_state = bg_processor.get_state()
 
     while True:
         ret, frame = cap.read()
@@ -357,25 +378,56 @@ def run_two_pass_tracking(
 
         # Process frame through background subtraction
         diff, mask, is_ready = bg_processor.process_frame(frame_idx, gray)
+        state = bg_processor.get_state()
+
+        if state != prev_state:
+            if state in (RotationState.ROTATING, RotationState.TRANSITION):
+                mouth_tracker.objects.clear()
+                mouth_tracker.disappeared.clear()
+                bulb_tracker.objects.clear()
+                bulb_tracker.disappeared.clear()
+                last_mouth_position = None
+            elif state == RotationState.STATIC:
+                last_mouth_position = None
+            prev_state = state
 
         if not is_ready:
             # Not enough frames yet, skip processing
             frame_idx += 1
             if frame_idx % 100 == 0:
                 print(f"Filling background buffer...")
+            if max_frames is not None and frame_idx >= max_frames:
+                break
             continue
 
-        # Rotate last mouth position if rotation is detected
-        last_mouth_position = bg_processor.rotate_point_if_needed(last_mouth_position)
+        if state != RotationState.STATIC:
+            # Skip tracking during rotation/transition episodes
+            mouth_tracker.update([])
+            bulb_tracker.update([])
+            frame_idx += 1
+
+            if frame_idx % 100 == 0:
+                print(f"Processed {frame_idx} frames")
+
+            if max_frames is not None and frame_idx >= max_frames:
+                break
+
+            continue
 
         # Detect mouth (larger objects)
-        mouth_stats = detect_objects_with_stats(mask, min_area=mouth_min_area, max_area=mouth_max_area)
+        mouth_stats = detect_objects_with_stats(
+            mask, min_area=mouth_min_area, max_area=mouth_max_area
+        )
 
         # Filter mouth detections by distance from last known position if enabled
         if mouth_search_radius is not None and last_mouth_position is not None:
             mouth_stats = [
-                m for m in mouth_stats
-                if np.linalg.norm(np.array(m['centroid']) - np.array(last_mouth_position)) <= mouth_search_radius
+                m
+                for m in mouth_stats
+                if np.linalg.norm(
+                    np.array(m["centroid"]) - np.array(last_mouth_position)
+                )
+                <= mouth_search_radius
             ]
 
         mouth_tracker.update(mouth_stats)
@@ -385,24 +437,32 @@ def run_two_pass_tracking(
         if mouth_tracker.objects:
             # Use the first (and typically only) mouth object
             first_mouth = next(iter(mouth_tracker.objects.values()))
-            mouth_position = first_mouth['centroid']
+            mouth_position = first_mouth["centroid"]
             last_mouth_position = mouth_position  # Update last known position
 
         # Detect bulbs (smaller objects)
-        bulb_stats = detect_objects_with_stats(mask, min_area=bulb_min_area, max_area=bulb_max_area)
+        bulb_stats = detect_objects_with_stats(
+            mask, min_area=bulb_min_area, max_area=bulb_max_area
+        )
 
         # Filter bulbs by distance from mouth position
         # - If mouth is tracked: use bulb_search_radius from current position
         # - If mouth is lost: use mouth_search_radius from last known position
         if mouth_position is not None and bulb_search_radius is not None:
             bulb_stats = [
-                b for b in bulb_stats
-                if np.linalg.norm(np.array(b['centroid']) - np.array(mouth_position)) <= bulb_search_radius
+                b
+                for b in bulb_stats
+                if np.linalg.norm(np.array(b["centroid"]) - np.array(mouth_position))
+                <= bulb_search_radius
             ]
         elif last_mouth_position is not None and mouth_search_radius is not None:
             bulb_stats = [
-                b for b in bulb_stats
-                if np.linalg.norm(np.array(b['centroid']) - np.array(last_mouth_position)) <= mouth_search_radius
+                b
+                for b in bulb_stats
+                if np.linalg.norm(
+                    np.array(b["centroid"]) - np.array(last_mouth_position)
+                )
+                <= mouth_search_radius
             ]
 
         bulb_tracker.update(bulb_stats)
@@ -422,15 +482,21 @@ def run_two_pass_tracking(
     if episodes:
         print(f"\nDetected {len(episodes)} rotation episode(s):")
         for i, ep in enumerate(episodes):
-            print(f"  Episode {i+1}: frames {ep.start_frame}-{ep.end_frame}, "
-                  f"total rotation: {ep.total_rotation_deg:.1f} deg")
+            print(
+                f"  Episode {i + 1}: frames {ep.start_frame}-{ep.end_frame}, "
+                f"total rotation: {ep.total_rotation_deg:.1f} deg"
+            )
 
     # Get data-oriented tracking results
     mouth_tracking = mouth_tracker.get_tracking_data()
     bulb_tracking = bulb_tracker.get_tracking_data()
 
-    print(f"Mouth tracking complete: {mouth_tracking.n_tracks} tracks, {mouth_tracking.n_frames} frames")
-    print(f"Bulb tracking complete: {bulb_tracking.n_tracks} tracks, {bulb_tracking.n_frames} frames")
+    print(
+        f"Mouth tracking complete: {mouth_tracking.n_tracks} tracks, {mouth_tracking.n_frames} frames"
+    )
+    print(
+        f"Bulb tracking complete: {bulb_tracking.n_tracks} tracks, {bulb_tracking.n_frames} frames"
+    )
 
     return mouth_tracking, bulb_tracking, fps, params
 
@@ -443,8 +509,9 @@ def merge_mouth_tracks(mouth_tracking: TrackingData) -> TrackingData:
     creating multiple non-overlapping track segments. This function links them
     into one unified track.
 
-    For frames where multiple tracks have data (overlap), the track with the
-    larger area is used.
+    For frames where multiple tracks have data (overlap), the track nearest to
+    the last known mouth position is preferred. If there is no prior position,
+    the track with the larger area is used.
 
     Args:
         mouth_tracking: TrackingData potentially containing multiple mouth track segments
@@ -477,6 +544,7 @@ def merge_mouth_tracks(mouth_tracking: TrackingData) -> TrackingData:
     # Track statistics for reporting
     tracks_used = set()
     overlap_frames = 0
+    last_mouth_position = None
 
     # For each frame, pick the best track data
     for frame_idx in range(n_frames):
@@ -493,22 +561,48 @@ def merge_mouth_tracks(mouth_tracking: TrackingData) -> TrackingData:
             # Exactly one track has data - use it
             best_idx = valid_tracks[0]
         else:
-            # Multiple tracks have data (overlap) - pick the one with largest area
+            # Multiple tracks have data (overlap)
             overlap_frames += 1
-            areas = [mouth_tracking.area[t, frame_idx] for t in valid_tracks]
-            best_idx = valid_tracks[np.argmax(areas)]
+            if last_mouth_position is None:
+                areas = [mouth_tracking.area[t, frame_idx] for t in valid_tracks]
+                best_idx = valid_tracks[np.argmax(areas)]
+            else:
+                distances = [
+                    np.linalg.norm(
+                        np.array(
+                            (
+                                mouth_tracking.x[t, frame_idx],
+                                mouth_tracking.y[t, frame_idx],
+                            )
+                        )
+                        - np.array(last_mouth_position)
+                    )
+                    for t in valid_tracks
+                ]
+                best_idx = valid_tracks[np.argmin(distances)]
 
         # Copy data from best track
         tracks_used.add(best_idx)
         merged_x[frame_idx] = mouth_tracking.x[best_idx, frame_idx]
         merged_y[frame_idx] = mouth_tracking.y[best_idx, frame_idx]
         merged_area[frame_idx] = mouth_tracking.area[best_idx, frame_idx]
-        merged_major_axis[frame_idx] = mouth_tracking.major_axis_length_mm[best_idx, frame_idx]
-        merged_bbox_min_row[frame_idx] = mouth_tracking.bbox_min_row[best_idx, frame_idx]
-        merged_bbox_min_col[frame_idx] = mouth_tracking.bbox_min_col[best_idx, frame_idx]
-        merged_bbox_max_row[frame_idx] = mouth_tracking.bbox_max_row[best_idx, frame_idx]
-        merged_bbox_max_col[frame_idx] = mouth_tracking.bbox_max_col[best_idx, frame_idx]
+        merged_major_axis[frame_idx] = mouth_tracking.major_axis_length_mm[
+            best_idx, frame_idx
+        ]
+        merged_bbox_min_row[frame_idx] = mouth_tracking.bbox_min_row[
+            best_idx, frame_idx
+        ]
+        merged_bbox_min_col[frame_idx] = mouth_tracking.bbox_min_col[
+            best_idx, frame_idx
+        ]
+        merged_bbox_max_row[frame_idx] = mouth_tracking.bbox_max_row[
+            best_idx, frame_idx
+        ]
+        merged_bbox_max_col[frame_idx] = mouth_tracking.bbox_max_col[
+            best_idx, frame_idx
+        ]
         merged_frame[frame_idx] = mouth_tracking.frame[best_idx, frame_idx]
+        last_mouth_position = (merged_x[frame_idx], merged_y[frame_idx])
 
     # Report what was merged
     valid_count = np.sum(~np.isnan(merged_x))

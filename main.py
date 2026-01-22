@@ -6,11 +6,15 @@ from src.adaptive_background import visualize_adaptive_background
 
 if __name__ == "__main__":
     # video_path = "/home/alex/Downloads/rotateAndHoldCCW_12112025_jelly1-12112025091630-0000.avi/rotateAndHoldCCW_12112025_jelly1-12112025091630-0000.avi"
-    video_path = "/home/alex/Downloads/rotateAndHoldCCW_12112025_jelly1-12112025091630-0000.avi/clip.avi"
+    # video_path = "/home/alex/Downloads/rotateAndHoldCCW_12112025_jelly1-12112025091630-0000.avi/clip.avi"
 
-    frames_to_analyze = 1*60*20  # Analyze first 1 minute (at 20 FPS)
+    video_path = "/run/media/alex/AKUSB/weissbourd_lab/amitRotatationVideos/2026-01-20/20260120_z4b_animal3-01202026140814-0000.avi"
+    video_path = "/run/media/alex/AKUSB/weissbourd_lab/amitRotatationVideos/2026-01-20/new_clip.avi"
 
-    save_base_path = "./saved_videos"
+
+    frames_to_analyze = 5*60*20  # Analyze first 1 minute (at 20 FPS)
+
+    save_base_path = "./saved_videos_new"
     zarr_path = "two_pass_tracking.zarr"
 
     # Run two-pass tracking: mouth (large) + bulbs (small)
@@ -19,7 +23,7 @@ if __name__ == "__main__":
         video_path,
         max_frames=frames_to_analyze,
         # Background buffer: uses rolling average of last N frames
-        background_buffer_size=10,
+        background_buffer_size=25,
         # Mouth detection parameters
         mouth_min_area=35,
         mouth_max_area=160,
@@ -84,17 +88,17 @@ if __name__ == "__main__":
         # rotation_stop_threshold_deg=0.005,
     )
 
-    # output_video_path = f"{save_base_path}/labeled_video_diff.mp4"
-    # save_two_pass_labeled_video(
-    #     video_path,
-    #     zarr_path,
-    #     output_video_path,
-    #     max_frames=frames_to_analyze,
-    #     show_direction_vector=True,
-    #     show_bulb_com=True,
-    #     background_mode="diff",
-    #     background_buffer_size=10,  # Match tracking buffer size
-    # )
+    output_video_path = f"{save_base_path}/labeled_video_diff.mp4"
+    save_two_pass_labeled_video(
+        video_path,
+        zarr_path,
+        output_video_path,
+        max_frames=frames_to_analyze,
+        show_direction_vector=True,
+        show_bulb_com=True,
+        background_mode="diff",
+        # background_buffer_size=10,  # Match tracking buffer size
+    )
 
 
     # Save adaptive background visualization (if used)

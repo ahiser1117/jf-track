@@ -12,7 +12,8 @@ class TrackingParameters:
     This dataclass holds all configurable tracking parameters, allowing them
     to be saved with tracking results and reused for visualization.
     """
-    # Background subtraction
+
+    # Background subtraction (frames sampled per episode)
     background_buffer_size: int = 10
     threshold: int = 10
 
@@ -43,12 +44,12 @@ class TrackingParameters:
         return d
 
     @classmethod
-    def from_dict(cls, d: dict) -> 'TrackingParameters':
+    def from_dict(cls, d: dict) -> "TrackingParameters":
         """Create TrackingParameters from a dictionary."""
         # Handle rotation_center: convert list back to tuple if present
-        if 'rotation_center' in d and d['rotation_center'] is not None:
+        if "rotation_center" in d and d["rotation_center"] is not None:
             d = d.copy()
-            d['rotation_center'] = tuple(d['rotation_center'])
+            d["rotation_center"] = tuple(d["rotation_center"])
         return cls(**d)
 
     def to_json(self) -> str:
@@ -56,7 +57,7 @@ class TrackingParameters:
         return json.dumps(self.to_dict())
 
     @classmethod
-    def from_json(cls, json_str: str) -> 'TrackingParameters':
+    def from_json(cls, json_str: str) -> "TrackingParameters":
         """Deserialize parameters from JSON string."""
         return cls.from_dict(json.loads(json_str))
 
@@ -67,6 +68,7 @@ class TrackingData:
     Data-oriented storage for tracking results.
     All arrays have shape (n_tracks, n_frames) with NaN padding for missing data.
     """
+
     n_tracks: int
     n_frames: int
 
@@ -87,7 +89,7 @@ class TrackingData:
     frame: np.ndarray  # (n_tracks, n_frames) - frame number for each detection
 
     @classmethod
-    def from_history(cls, history: dict, n_frames: int) -> 'TrackingData':
+    def from_history(cls, history: dict, n_frames: int) -> "TrackingData":
         """
         Convert tracker history dict to data-oriented arrays.
 
@@ -114,15 +116,19 @@ class TrackingData:
             track_history = history[obj_id]
             for frame_idx, detection in enumerate(track_history):
                 if detection is not None:
-                    x[track_idx, frame_idx] = detection['centroid'][0]
-                    y[track_idx, frame_idx] = detection['centroid'][1]
-                    area[track_idx, frame_idx] = detection['area']
-                    major_axis_length_mm[track_idx, frame_idx] = detection['major_axis_length_mm']
-                    bbox_min_row[track_idx, frame_idx] = detection['bounding_box'][0]
-                    bbox_min_col[track_idx, frame_idx] = detection['bounding_box'][1]
-                    bbox_max_row[track_idx, frame_idx] = detection['bounding_box'][2]
-                    bbox_max_col[track_idx, frame_idx] = detection['bounding_box'][3]
-                    frame[track_idx, frame_idx] = frame_idx + 1  # 1-indexed frame number
+                    x[track_idx, frame_idx] = detection["centroid"][0]
+                    y[track_idx, frame_idx] = detection["centroid"][1]
+                    area[track_idx, frame_idx] = detection["area"]
+                    major_axis_length_mm[track_idx, frame_idx] = detection[
+                        "major_axis_length_mm"
+                    ]
+                    bbox_min_row[track_idx, frame_idx] = detection["bounding_box"][0]
+                    bbox_min_col[track_idx, frame_idx] = detection["bounding_box"][1]
+                    bbox_max_row[track_idx, frame_idx] = detection["bounding_box"][2]
+                    bbox_max_col[track_idx, frame_idx] = detection["bounding_box"][3]
+                    frame[track_idx, frame_idx] = (
+                        frame_idx + 1
+                    )  # 1-indexed frame number
 
         return cls(
             n_tracks=n_tracks,
@@ -156,7 +162,9 @@ class RobustTracker:
         self.objects[self.nextObjectID] = detection
         self.disappeared[self.nextObjectID] = 0
         # Prefill history with None for all frames before this detection
-        self.history[self.nextObjectID] = [None] * (self.current_frame - 1) + [detection]
+        self.history[self.nextObjectID] = [None] * (self.current_frame - 1) + [
+            detection
+        ]
         self.nextObjectID += 1
 
     def deregister(self, objectID):
@@ -190,8 +198,8 @@ class RobustTracker:
 
         # --- Core Matching Logic ---
         objectIDs = list(self.objects.keys())
-        objectCentroids = [obj['centroid'] for obj in self.objects.values()]
-        detectionCentroids = [d['centroid'] for d in detections]
+        objectCentroids = [obj["centroid"] for obj in self.objects.values()]
+        detectionCentroids = [d["centroid"] for d in detections]
 
         # Calculate Distance Matrix
         D = np.zeros((len(objectCentroids), len(detectionCentroids)))
