@@ -1,5 +1,6 @@
 *__pycache__
 *saved_videos
+*saved_videos_new
 *.zarr
 *.zip
 *.venv
