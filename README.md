@@ -2,6 +2,8 @@
 
 A video tracking system for jellyfish microscopy, featuring two-pass detection of anatomical features and adaptive background subtraction for rotating backgrounds.
 
+NOTE: This app was entirely developed using Agent-based development tools (Claude Code, Codex, OpenCode).
+
 ## Features
 
 - **Two-pass tracking**: Detects larger features (mouth) and smaller features (bulbs) separately with different size thresholds
