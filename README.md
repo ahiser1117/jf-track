@@ -21,10 +21,8 @@ NOTE: This app was entirely developed using Agent-based development tools (Claud
 git clone https://github.com/ahiser1117/jf-track.git
 cd jf-track
 
-# Create virtual environment and install dependencies
-uv venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-uv pip install -r requirements.txt
+# Install dependencies (creates .venv automatically)
+uv sync
 ```
 
 ### Using pip
@@ -38,8 +36,8 @@ cd jf-track
 python -m venv .venv
 source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 
-# Install dependencies
-pip install -r requirements.txt
+# Install the package and its dependencies
+pip install .
 ```
 
 ### Dependencies
