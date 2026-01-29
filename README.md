@@ -7,10 +7,11 @@ NOTE: This app was entirely developed using Agent-based development tools (Claud
 ## Features
 
 - **Two-pass tracking**: Detects larger features (mouth) and smaller features (bulbs) separately with different size thresholds
-- **Rolling background subtraction**: Uses median of recent frames rather than a static background
-- **Rotation-compensated background**: Handles videos where the sample rotates, automatically detecting rotation and aligning frames
+- **Episode-based median background**: Computes a median background from evenly spaced frames within each static episode
+- **Rotation-compensated background**: Handles rotating samples with ORB + RANSAC and a STATIC/ROTATING/TRANSITION state machine
 - **Direction analysis**: Computes orientation vector from bulb center-of-mass to mouth position
 - **Circular ROI masking**: Constrains tracking to central region where jellyfish is expected
+- **Search-radius filtering**: Optional spatial filters for mouth re-acquisition and bulb detection
 
 ## Installation
 
@@ -42,12 +43,9 @@ pip install .
 
 ### Dependencies
 
-- Python 3.10+
-- OpenCV (`opencv-python`)
-- NumPy
-- SciPy
-- scikit-image
-- zarr
+- Python 3.12+
+- Core tracking dependencies: OpenCV (`opencv-python`), NumPy, SciPy, scikit-image, zarr
+- See `pyproject.toml` for the full dependency list (analysis notebooks and optional tooling)
 
 ## Quick Start
 
@@ -58,7 +56,7 @@ from src.save_results import save_two_pass_tracking_to_zarr
 from src.visualizations import save_two_pass_labeled_video
 
 # Run tracking
-mouth_tracking_raw, bulb_tracking, fps = run_two_pass_tracking(
+mouth_tracking_raw, bulb_tracking, fps, params = run_two_pass_tracking(
     "path/to/video.avi",
     max_frames=1000,
     background_buffer_size=10,
@@ -72,7 +70,14 @@ mouth_tracking = merge_mouth_tracks(mouth_tracking_raw)
 direction = compute_direction_analysis(mouth_tracking, bulb_tracking)
 
 # Save results
-save_two_pass_tracking_to_zarr(mouth_tracking, bulb_tracking, direction, "output.zarr", fps)
+save_two_pass_tracking_to_zarr(
+    mouth_tracking,
+    bulb_tracking,
+    direction,
+    "output.zarr",
+    fps,
+    parameters=params,
+)
 
 # Create visualization
 save_two_pass_labeled_video("path/to/video.avi", "output.zarr", "labeled.mp4")
@@ -82,13 +87,17 @@ save_two_pass_labeled_video("path/to/video.avi", "output.zarr", "labeled.mp4")
 
 ### Background Subtraction
 
-The system uses a **rolling median background** computed from the last N frames (default 10). This adapts to gradual changes in illumination while maintaining sensitivity to moving objects.
+The system uses **episode-based median backgrounds** computed from evenly spaced frames within each static episode (default 10 samples). This adapts to gradual illumination changes while keeping a stable reference for subtraction.
+
+When `adaptive_background=False`, the entire video is treated as a single static episode.
 
 For videos where the sample rotates:
 1. Frame-to-frame rotation is estimated using ORB feature matching
 2. When rotation exceeds a threshold, the system enters "rotating" mode
 3. Buffered frames are rotated to align with the current orientation before computing the median
-4. After rotation stops, the system transitions back to static mode with a fresh background
+4. After rotation stops, the system transitions back to static mode and builds a new static background
+
+Tracking is **skipped during ROTATING/TRANSITION** states; detections only occur during STATIC episodes.
 
 ### Two-Pass Detection
 
@@ -109,14 +118,14 @@ Objects outside this region are ignored.
 
 ### Track Merging
 
-The mouth may be temporarily lost due to occlusion. The `merge_mouth_tracks()` function links non-overlapping track segments into a single continuous track. When tracks overlap (rare), the detection with larger area is used.
+The mouth may be temporarily lost due to occlusion. The `merge_mouth_tracks()` function links non-overlapping track segments into a single continuous track. When tracks overlap (rare), the track closest to the last known position is preferred; if no prior position exists, the larger-area detection is used.
 
 ### Direction Analysis
 
 For each frame, the system computes:
 - Bulb center-of-mass (average position of all detected bulbs)
 - Direction vector from bulb CoM to mouth
-- Direction angle and magnitude
+- Direction angle and magnitude (0° = right, 90° = up in image coordinates)
 
 Positions are temporally smoothed to reduce noise.
 
@@ -136,9 +145,13 @@ output.zarr/
 └── direction/
     ├── mouth_x, mouth_y
     ├── bulb_com_x, bulb_com_y
+    ├── bulb_count
     ├── direction_x, direction_y
+    ├── direction_magnitude
     └── direction_angle_deg
 ```
+
+Tracking parameters are stored in zarr attributes (`parameters`) when provided to `save_two_pass_tracking_to_zarr()`.
 
 ## Visualization
 
@@ -154,13 +167,15 @@ Background modes:
 - `"diff"`: Background subtraction difference (shows what tracking sees)
 - `"mask"`: Binary mask after thresholding
 
+`save_two_pass_labeled_video()` can auto-load tracking parameters from the zarr store to keep visualization aligned with the tracking run (thresholds, buffer size, search radii, adaptive background settings).
+
 ## Configuration
 
 Key parameters for `run_two_pass_tracking()`:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `background_buffer_size` | 10 | Frames for rolling median background |
+| `background_buffer_size` | 10 | Frames sampled per static episode for median background |
 | `threshold` | 10 | Binary threshold for background subtraction |
 | `mouth_min_area` | 35 | Minimum mouth area (pixels) |
 | `mouth_max_area` | 160 | Maximum mouth area (pixels) |
@@ -168,6 +183,9 @@ Key parameters for `run_two_pass_tracking()`:
 | `bulb_max_area` | 35 | Maximum bulb area (pixels) |
 | `adaptive_background` | False | Enable rotation compensation |
 | `rotation_start_threshold_deg` | 0.01 | Rotation detection threshold (deg/frame) |
+| `rotation_stop_threshold_deg` | 0.005 | Rotation stop threshold (deg/frame) |
+| `mouth_search_radius` | None | Max distance from last mouth position for re-detection |
+| `bulb_search_radius` | None | Max distance from mouth for bulb filtering |
 
 ## License
 
