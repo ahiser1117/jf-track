@@ -5,3 +5,6 @@
 *.zip
 *.venv
 *.mp4
+venv/
+.DS_Store
+*.avi
