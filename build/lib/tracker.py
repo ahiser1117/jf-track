@@ -36,9 +36,8 @@ class TrackingParameters:
 
     # Multi-object configuration (new extensible system)
     # Object counts (user-configurable)
-    num_mouths: int = 1
     num_gonads: int = 0  # 0-4 gonads per animal
-    num_tentacle_bulbs: int | None = None  # None = auto-detect unlimited
+    num_tentacle_bulbs: int = 0  # User-specified number
 
     # ROI configuration (interactive selection)
     roi_mode: str = "auto"  # "auto", "circle", "polygon"
@@ -130,28 +129,15 @@ class TrackingParameters:
 
     def update_object_counts(self):
         """Update object type enabled status based on count parameters."""
-        # Ensure mouth configuration reflects requested count
-        if "mouth" in self.object_types:
-            mouth_count = max(self.num_mouths, 0)
-            mouth_enabled = mouth_count > 0
-            self.object_types["mouth"]["enabled"] = mouth_enabled
-            self.object_types["mouth"]["count"] = mouth_count if mouth_enabled else None
-
         # Enable gonads if count > 0
         if "gonad" in self.object_types:
             self.object_types["gonad"]["enabled"] = self.num_gonads > 0
             self.object_types["gonad"]["count"] = self.num_gonads
-
+        
         # Enable tentacle bulbs if count > 0
         if "tentacle_bulb" in self.object_types:
-            if self.num_tentacle_bulbs is None:
-                # Auto-detect mode: enabled with no hard cap
-                self.object_types["tentacle_bulb"]["enabled"] = True
-                self.object_types["tentacle_bulb"]["count"] = None
-            else:
-                bulb_count = max(self.num_tentacle_bulbs, 0)
-                self.object_types["tentacle_bulb"]["enabled"] = bulb_count > 0
-                self.object_types["tentacle_bulb"]["count"] = bulb_count if bulb_count > 0 else None
+            self.object_types["tentacle_bulb"]["enabled"] = self.num_tentacle_bulbs > 0
+            self.object_types["tentacle_bulb"]["count"] = self.num_tentacle_bulbs
 
     def get_enabled_object_types(self) -> list[str]:
         """Get list of enabled object types for tracking."""
@@ -385,5 +371,3 @@ class RobustTracker:
     def get_tracking_data(self) -> TrackingData:
         """Convert tracker history to data-oriented TrackingData object."""
         return TrackingData.from_history(self.history, self.current_frame)
-    # Video type selection (rotating vs non-rotating)
-    video_type: str = "non_rotating"

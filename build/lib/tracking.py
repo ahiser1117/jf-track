@@ -6,84 +6,6 @@ from src.tracker import RobustTracker, TrackingData, TrackingParameters
 from src.adaptive_background import BackgroundProcessor, RotationState
 
 
-class ROIMedianBackgroundProcessor:
-    """Simple ROI-aware median background builder for non-rotating videos."""
-
-    def __init__(
-        self,
-        video_path: str,
-        roi_mask: np.ndarray | None,
-        threshold: int,
-        sample_count: int = 10,
-        max_frames: int | None = None,
-    ) -> None:
-        self.threshold = threshold
-        self._roi_mask = roi_mask
-        self._has_roi = roi_mask is not None
-        self._background = self._compute_roi_median(
-            video_path, roi_mask, sample_count, max_frames
-        )
-
-    def _compute_roi_median(
-        self,
-        video_path: str,
-        roi_mask: np.ndarray | None,
-        sample_count: int,
-        max_frames: int | None,
-    ) -> np.ndarray:
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            raise ValueError(f"Could not open video: {video_path}")
-
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
-        if max_frames is not None:
-            total_frames = min(total_frames, max_frames)
-        if total_frames <= 0:
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
-
-        if total_frames == 0:
-            raise ValueError("Video contains zero frames; cannot compute background")
-
-        n_samples = min(sample_count, total_frames)
-        indices = np.linspace(0, total_frames - 1, n_samples).astype(int)
-        samples: list[np.ndarray] = []
-
-        for idx in indices:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
-            ret, frame = cap.read()
-            if not ret:
-                continue
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            if roi_mask is not None:
-                gray = cv2.bitwise_and(gray, roi_mask)
-            samples.append(gray.astype(np.float32))
-
-        cap.release()
-
-        if not samples:
-            raise ValueError("Unable to sample frames for background computation")
-
-        background = np.median(np.stack(samples, axis=0), axis=0).astype(np.uint8)
-        return background
-
-    def process_frame(
-        self, frame_idx: int, gray: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray, bool]:
-        if self._has_roi and self._roi_mask is not None:
-            gray = cv2.bitwise_and(gray, self._roi_mask)
-
-        diff = cv2.absdiff(gray, self._background)
-        _, mask = cv2.threshold(diff, self.threshold, 255, cv2.THRESH_BINARY)
-
-        if self._has_roi and self._roi_mask is not None:
-            mask = cv2.bitwise_and(mask, self._roi_mask)
-
-        return diff, mask, True
-
-    def get_roi_mask(self) -> np.ndarray | None:
-        return self._roi_mask
-
-
 def rotate_point(
     point: tuple[float, float], angle_deg: float, center: tuple[float, float]
 ) -> tuple[float, float]:
@@ -836,7 +758,7 @@ def run_multi_object_tracking(
     params: TrackingParameters,
     max_frames: int | None = None,
     pixel_size_mm: float = 0.01,
-) -> tuple[dict[str, TrackingData], float]:
+) -> dict[str, TrackingData]:
     """
     Multi-object tracking pipeline with configurable object types.
     
@@ -850,12 +772,9 @@ def run_multi_object_tracking(
         pixel_size_mm: For converting pixel lengths to mm
     
     Returns:
-        Tuple of (tracking_results, fps) where tracking_results maps object
-        types to TrackingData and fps is the video frame rate.
+        Dictionary mapping object types to their TrackingData results
     """
     print(f"Starting multi-object tracking on: {video_path}")
-    video_type = getattr(params, "video_type", "non_rotating") or "non_rotating"
-    video_type = video_type.lower()
     
     # Get enabled object types
     enabled_types = params.get_enabled_object_types()
@@ -878,46 +797,28 @@ def run_multi_object_tracking(
     
     # Create ROI mask based on configuration
     roi_params = params.get_roi_params()
-    roi_mode = (roi_params.get("mode") or "auto").lower()
-    roi_mask = None
-    if roi_mode in {"circle", "polygon"}:
-        roi_mask = create_roi_mask(
-            height=height,
-            width=width,
-            roi_mode=roi_mode,
-            center=roi_params.get("center"),
-            radius=roi_params.get("radius"),
-            points=roi_params.get("points"),
-        )
-    elif roi_mode == "auto" and video_type == "non_rotating":
-        raise ValueError("Non-rotating mode requires a user-defined ROI (circle or polygon).")
-
+    roi_mask = create_roi_mask(
+        height=height,
+        width=width,
+        roi_mode=roi_params["mode"],
+        center=roi_params["center"],
+        radius=roi_params["radius"],
+        points=roi_params["points"]
+    )
+    
     # Initialize background processor
-    if video_type == "rotating":
-        params.adaptive_background = True
-        bg_processor = BackgroundProcessor(
-            video_path=video_path,
-            width=width,
-            height=height,
-            background_buffer_size=params.background_buffer_size,
-            threshold=params.threshold,
-            adaptive_background=True,
-            rotation_start_threshold_deg=params.rotation_start_threshold_deg,
-            rotation_stop_threshold_deg=params.rotation_stop_threshold_deg,
-            rotation_center=params.rotation_center,
-            max_frames=max_frames,
-        )
-    else:
-        params.adaptive_background = False
-        if roi_mask is None:
-            roi_mask = create_roi_mask(height, width, "auto", None, None, None)
-        bg_processor = ROIMedianBackgroundProcessor(
-            video_path=video_path,
-            roi_mask=roi_mask,
-            threshold=params.threshold,
-            sample_count=params.background_buffer_size,
-            max_frames=max_frames,
-        )
+    bg_processor = BackgroundProcessor(
+        video_path=video_path,
+        width=width,
+        height=height,
+        background_buffer_size=params.background_buffer_size,
+        threshold=params.threshold,
+        adaptive_background=params.adaptive_background,
+        rotation_start_threshold_deg=params.rotation_start_threshold_deg,
+        rotation_stop_threshold_deg=params.rotation_stop_threshold_deg,
+        rotation_center=params.rotation_center,
+        max_frames=max_frames
+    )
     
     # Initialize trackers for each enabled object type
     trackers = {}
@@ -947,8 +848,6 @@ def run_multi_object_tracking(
         # Background subtraction
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         diff, mask, is_ready = bg_processor.process_frame(frame_idx, gray)
-        if roi_mask is not None and mask is not None and video_type == "rotating":
-            mask = cv2.bitwise_and(mask, roi_mask)
         
         if not is_ready:
             # Background not ready yet, skip this frame
@@ -1019,7 +918,7 @@ def run_multi_object_tracking(
             f"{tracking_data.n_tracks} tracks, {tracking_data.n_frames} frames"
         )
     
-    return results, fps
+    return results
 
 
 def create_roi_mask(height: int, width: int, roi_mode: str = "auto",
