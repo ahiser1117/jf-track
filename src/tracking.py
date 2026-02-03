@@ -410,6 +410,9 @@ def run_two_pass_tracking(
     adaptive_background: bool = False,
     rotation_start_threshold_deg: float = 0.01,
     rotation_stop_threshold_deg: float = 0.005,
+    rotation_start_frames: int = 3,
+    rotation_confidence_threshold: float = 0.3,
+    min_episode_rotation_deg: float = 5.0,
     rotation_center: tuple[float, float] | None = None,
 ) -> tuple[TrackingData, TrackingData, float, TrackingParameters]:
     """
@@ -462,6 +465,9 @@ def run_two_pass_tracking(
         adaptive_background=adaptive_background,
         rotation_start_threshold_deg=rotation_start_threshold_deg,
         rotation_stop_threshold_deg=rotation_stop_threshold_deg,
+        rotation_start_frames=rotation_start_frames,
+        rotation_confidence_threshold=rotation_confidence_threshold,
+        min_episode_rotation_deg=min_episode_rotation_deg,
         rotation_center=rotation_center,
     )
 
@@ -493,6 +499,9 @@ def run_two_pass_tracking(
         adaptive_background=adaptive_background,
         rotation_start_threshold_deg=rotation_start_threshold_deg,
         rotation_stop_threshold_deg=rotation_stop_threshold_deg,
+        rotation_start_frames=rotation_start_frames,
+        rotation_confidence_threshold=rotation_confidence_threshold,
+        min_episode_rotation_deg=min_episode_rotation_deg,
         rotation_center=rotation_center,
         max_frames=max_frames,
         roi_mask=None,
@@ -868,6 +877,9 @@ def run_multi_object_tracking(
         adaptive_background=params.adaptive_background,
         rotation_start_threshold_deg=params.rotation_start_threshold_deg,
         rotation_stop_threshold_deg=params.rotation_stop_threshold_deg,
+        rotation_start_frames=params.rotation_start_frames,
+        rotation_confidence_threshold=params.rotation_confidence_threshold,
+        min_episode_rotation_deg=params.min_episode_rotation_deg,
         rotation_center=params.rotation_center,
         max_frames=max_frames,
         roi_mask=roi_mask,

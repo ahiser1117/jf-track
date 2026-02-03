@@ -25,6 +25,9 @@ def save_two_pass_labeled_video(
     rotation_start_threshold_deg: float | None = None,
     rotation_stop_threshold_deg: float | None = None,
     rotation_center: tuple[float, float] | None = None,
+    rotation_start_frames: int | None = None,
+    rotation_confidence_threshold: float | None = None,
+    min_episode_rotation_deg: float | None = None,
 ):
     """
     Save a labeled video with two-pass tracking annotations (mouth + bulbs).
@@ -51,6 +54,9 @@ def save_two_pass_labeled_video(
         rotation_start_threshold_deg: Degrees/frame to trigger rotation detection
         rotation_stop_threshold_deg: Degrees/frame to consider rotation stopped
         rotation_center: Fixed rotation center (cx, cy), or None for auto-detection
+        rotation_start_frames: Consecutive high-rotation frames required to trigger rotation
+        rotation_confidence_threshold: Minimum rotation confidence to accept rotation
+        min_episode_rotation_deg: Minimum rotation magnitude required to keep an episode
     """
     root = zarr.open_group(zarr_path, mode="r")
 
@@ -117,6 +123,27 @@ def save_two_pass_labeled_video(
         if saved_params is not None
         else None
     )
+    _rotation_start_frames: int = (
+        rotation_start_frames
+        if rotation_start_frames is not None
+        else saved_params.rotation_start_frames
+        if saved_params is not None
+        else 3
+    )
+    _rotation_confidence: float = (
+        rotation_confidence_threshold
+        if rotation_confidence_threshold is not None
+        else saved_params.rotation_confidence_threshold
+        if saved_params is not None
+        else 0.3
+    )
+    _min_episode_rotation: float = (
+        min_episode_rotation_deg
+        if min_episode_rotation_deg is not None
+        else saved_params.min_episode_rotation_deg
+        if saved_params is not None
+        else 5.0
+    )
 
     # Load mouth tracking data
     mouth_group = root["mouth"]
@@ -165,6 +192,9 @@ def save_two_pass_labeled_video(
             adaptive_background=_adaptive_bg,
             rotation_start_threshold_deg=_rotation_start,
             rotation_stop_threshold_deg=_rotation_stop,
+            rotation_start_frames=_rotation_start_frames,
+            rotation_confidence_threshold=_rotation_confidence,
+            min_episode_rotation_deg=_min_episode_rotation,
             rotation_center=_rotation_center,
             max_frames=max_frames,
         )
@@ -761,6 +791,9 @@ def save_multi_object_labeled_video(
         adaptive_background=params.adaptive_background,
         rotation_start_threshold_deg=params.rotation_start_threshold_deg,
         rotation_stop_threshold_deg=params.rotation_stop_threshold_deg,
+        rotation_start_frames=params.rotation_start_frames,
+        rotation_confidence_threshold=params.rotation_confidence_threshold,
+        min_episode_rotation_deg=params.min_episode_rotation_deg,
         rotation_center=params.rotation_center,
         max_frames=max_frames,
         roi_mask=roi_mask,

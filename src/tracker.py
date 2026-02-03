@@ -142,6 +142,9 @@ class TrackingParameters:
     adaptive_background: bool = False
     rotation_start_threshold_deg: float = 0.01
     rotation_stop_threshold_deg: float = 0.005
+    rotation_start_frames: int = 3
+    rotation_confidence_threshold: float = 0.3
+    min_episode_rotation_deg: float = 5.0
     rotation_center: tuple[float, float] | None = None
 
     def to_dict(self) -> dict:

@@ -120,6 +120,7 @@ save_two_pass_labeled_video("path/to/video.avi", "output.zarr", "labeled.mp4")
 - **Non-rotating videos**: `BackgroundProcessor` samples up to 60 evenly spaced frames (respecting `max_frames` when provided), computes a median-intensity projection from those samples, and optionally derives an Otsu threshold from the residuals. This produces a single global background that matches what the tracker and labeled videos use, without loading the entire video into memory.
 
 - **Rotating videos**: `AdaptiveBackgroundManager` monitors frame-to-frame rotation with ORB + RANSAC, maintains a STATIC/ROTATING/TRANSITION state machine, and only produces masks during STATIC episodes. Buffered frames are rotated to align with the current orientation before computing the median, and search centers are rotated while the sample spins so they reappear in the correct coordinates when the episode stabilizes.
+- Rotation detection now requires multiple consecutive high-confidence angle estimates and ignores any episode whose total rotation is below `min_episode_rotation_deg` (default 5°). This prevents jitter/noise from pausing tracking unnecessarily.
 
 Tracking is **skipped during ROTATING/TRANSITION** states; detections only occur during STATIC episodes.
 

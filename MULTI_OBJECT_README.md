@@ -64,6 +64,7 @@ This computes the bulb center-of-mass per frame, averages the distances from eac
 ## 🌀 Video Types & ROI Expectations
 
 - **Rotating videos** – choose “Yes” when prompted. The adaptive background state machine (STATIC/ROTATING/TRANSITION) activates automatically, the search centers are rotated during motion, and the default ROI is a centered circle unless you draw a custom region.
+- Small jitters are ignored: rotation only triggers after several confident consecutive measurements, and any episode with <5° total motion is discarded so tracking stays active on non-rotating clips.
 
 - **Non-rotating videos** – choose “No.” A full-video median background is computed once and reused. If you skip feature sampling, the tracker falls back to the automatic per-video threshold; otherwise the sampler’s slider defines the threshold explicitly.
 

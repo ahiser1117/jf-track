@@ -319,11 +319,15 @@ class AdaptiveBackgroundManager:
         rotation_start_threshold_deg: float = 0.5,
         rotation_stop_threshold_deg: float = 0.1,
         rotation_stop_frames: int = 10,
+        rotation_start_frames: int = 3,
+        rotation_confidence_threshold: float = 0.3,
         # Rotation estimation
         n_features: int = 500,
         min_inliers: int = 20,
         # Smoothing
         angle_smoothing_window: int = 5,
+        # Episode filtering
+        min_episode_rotation_deg: float = 5.0,
     ):
         """
         Args:
@@ -333,9 +337,12 @@ class AdaptiveBackgroundManager:
             rotation_start_threshold_deg: Min angle/frame to trigger rotation
             rotation_stop_threshold_deg: Max angle/frame to consider stopped
             rotation_stop_frames: Consecutive low-rotation frames to exit
+            rotation_start_frames: Consecutive high-rotation frames required to enter rotation
+            rotation_confidence_threshold: Minimum confidence needed to accept a rotation estimate
             n_features: ORB features for rotation estimation
             min_inliers: Minimum feature matches for valid rotation
             angle_smoothing_window: Frames to smooth rotation estimates
+            min_episode_rotation_deg: Minimum absolute rotation required to keep an episode
         """
         self.video_path = video_path
         self.buffer_size = buffer_size
@@ -343,6 +350,9 @@ class AdaptiveBackgroundManager:
         self.rotation_start_threshold_deg = rotation_start_threshold_deg
         self.rotation_stop_threshold_deg = rotation_stop_threshold_deg
         self.rotation_stop_frames = rotation_stop_frames
+        self.rotation_start_frames = max(1, int(rotation_start_frames))
+        self.rotation_confidence_threshold = rotation_confidence_threshold
+        self.min_episode_rotation_deg = min_episode_rotation_deg
         self.angle_smoothing_window = angle_smoothing_window
 
         # Create rotation estimator
@@ -368,6 +378,8 @@ class AdaptiveBackgroundManager:
         # Rotation detection history
         self._angle_history: deque[float] = deque(maxlen=angle_smoothing_window)
         self._low_rotation_count: int = 0
+        self._high_rotation_count: int = 0
+        self._last_confidence: float = 0.0
 
         # Transition state
         self._transition_frames: list[np.ndarray] = []
@@ -375,6 +387,7 @@ class AdaptiveBackgroundManager:
         # Episode tracking
         self._rotation_episodes: list[RotationEpisode] = []
         self._current_episode: RotationEpisode | None = None
+        self._discarded_episodes: int = 0
 
         # Center estimation during rotation
         self._rotation_start_frame: np.ndarray | None = None
@@ -578,10 +591,13 @@ class AdaptiveBackgroundManager:
         # Extract angle (0 if no estimate)
         if rotation_estimate is not None:
             angle = rotation_estimate.angle_deg
-            self._angle_history.append(angle)
+            confidence = rotation_estimate.confidence
         else:
             angle = 0.0
-            self._angle_history.append(0.0)
+            confidence = 0.0
+
+        self._last_confidence = confidence
+        self._angle_history.append(angle)
 
         # Compute smoothed angle
         smoothed_angle = (
@@ -590,19 +606,26 @@ class AdaptiveBackgroundManager:
 
         if self._state == RotationState.STATIC:
             # Check for rotation onset
-            if abs(smoothed_angle) > self.rotation_start_threshold_deg:
+            if (
+                abs(smoothed_angle) > self.rotation_start_threshold_deg
+                and confidence >= self.rotation_confidence_threshold
+            ):
+                self._high_rotation_count += 1
+            else:
+                self._high_rotation_count = 0
+
+            if self._high_rotation_count >= self.rotation_start_frames:
                 self._enter_rotating_state(frame_idx)
-                # Accumulate the first frame's rotation immediately
-                # (so cumulative matches what rotate_point_if_needed will apply)
                 self._cumulative_rotation_deg += smoothed_angle
                 self._cache_valid = False
-                # Update episode tracking
                 if self._current_episode is not None:
                     self._current_episode.total_rotation_deg = (
                         self._cumulative_rotation_deg
                     )
+                self._high_rotation_count = 0
 
         elif self._state == RotationState.ROTATING:
+            self._high_rotation_count = 0
             # Accumulate rotation
             self._cumulative_rotation_deg += smoothed_angle
             self._cache_valid = False  # Alignment changes each frame
@@ -629,6 +652,7 @@ class AdaptiveBackgroundManager:
                 self._low_rotation_count = 0
 
         elif self._state == RotationState.TRANSITION:
+            self._high_rotation_count = 0
             # Continue accumulating rotation during transition
             self._cumulative_rotation_deg += smoothed_angle
             self._cache_valid = False
@@ -719,6 +743,7 @@ class AdaptiveBackgroundManager:
 
         # Finalize episode
         if self._current_episode is not None:
+            self._current_episode.total_rotation_deg = self._cumulative_rotation_deg
             self._current_episode.end_frame = frame_idx
             self._current_episode.rotation_center = self._rotation_center or (0, 0)
             n_frames = frame_idx - self._current_episode.start_frame
@@ -726,14 +751,20 @@ class AdaptiveBackgroundManager:
                 self._current_episode.angular_velocity_deg = (
                     self._current_episode.total_rotation_deg / n_frames
                 )
-            self._rotation_episodes.append(self._current_episode)
+            total_rotation = abs(self._current_episode.total_rotation_deg)
+            if total_rotation < self.min_episode_rotation_deg:
+                self._discarded_episodes += 1
+                print(
+                    f"[AdaptiveBG] Ignoring spurious rotation episode (total {total_rotation:.2f} deg < {self.min_episode_rotation_deg} deg)"
+                )
+            else:
+                self._rotation_episodes.append(self._current_episode)
+                print(
+                    f"[AdaptiveBG] Rotation stopped at frame {frame_idx}, "
+                    f"total: {self._cumulative_rotation_deg:.1f} deg, "
+                    f"center: {self._rotation_center}"
+                )
             self._current_episode = None
-
-        print(
-            f"[AdaptiveBG] Rotation stopped at frame {frame_idx}, "
-            f"total: {self._cumulative_rotation_deg:.1f} deg, "
-            f"center: {self._rotation_center}"
-        )
 
     def _complete_transition(self) -> None:
         """Complete transition: reset buffer with transition frames."""
@@ -876,6 +907,9 @@ class BackgroundProcessor:
         adaptive_background: bool = False,
         rotation_start_threshold_deg: float = 0.01,
         rotation_stop_threshold_deg: float = 0.005,
+        rotation_start_frames: int = 3,
+        rotation_confidence_threshold: float = 0.3,
+        min_episode_rotation_deg: float = 5.0,
         rotation_center: tuple[float, float] | None = None,
         max_frames: int | None = None,
         roi_mask: np.ndarray | None = None,
@@ -893,6 +927,9 @@ class BackgroundProcessor:
             adaptive_background: Enable rotation-compensated background
             rotation_start_threshold_deg: Degrees/frame to trigger rotation detection
             rotation_stop_threshold_deg: Degrees/frame to consider rotation stopped
+            rotation_start_frames: Consecutive high-rotation frames required to trigger rotation
+            rotation_confidence_threshold: Minimum rotation confidence to accept rotation
+            min_episode_rotation_deg: Minimum absolute rotation to keep an episode
             rotation_center: Fixed rotation center (cx, cy), or None for auto-detection
             max_frames: Maximum frames to process (for initialization)
         """
@@ -921,6 +958,9 @@ class BackgroundProcessor:
                 buffer_size=background_buffer_size,
                 rotation_start_threshold_deg=rotation_start_threshold_deg,
                 rotation_stop_threshold_deg=rotation_stop_threshold_deg,
+                rotation_start_frames=rotation_start_frames,
+                rotation_confidence_threshold=rotation_confidence_threshold,
+                min_episode_rotation_deg=min_episode_rotation_deg,
             )
             self._adaptive_manager.initialize(
                 max_frames=max_frames,
