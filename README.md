@@ -138,6 +138,13 @@ Both passes use the same background-subtracted mask but with different size filt
 - **Non-rotating videos** default to full-frame ROI unless a custom shape is provided.
 - ROI masks are applied to binary masks after thresholding, before any connected-component analysis.
 
+### Object Permanence Heuristics
+
+- Mouth detections seed a smoothed reference position. Gonads and bulbs automatically discard detections that fall inside the configured `mouth_exclusion_radius` or that jump too far from their last smoothed centroid.
+- Each object type has a dedicated `search_radius` (relative to the mouth) and a `track_search_radius` (relative to its own tracks) so reassociation favors spatially nearby detections and resists sudden swaps.
+- Components claimed by the mouth are removed from the candidate list before evaluating downstream objects, which prevents gonads or bulbs from reusing the same blobs in the same frame.
+- Every connected component is scored for each enabled object type (shape + distance + overlap penalties). When gonad and bulb candidates conflict, the higher-scoring class keeps the component, so brief overlaps no longer trigger label switching.
+
 ### Track Merging
 
 The mouth may be temporarily lost due to occlusion. The `merge_mouth_tracks()` function links non-overlapping track segments into a single continuous track. When tracks overlap (rare), the track closest to the last known position is preferred; if no prior position exists, the larger-area detection is used.

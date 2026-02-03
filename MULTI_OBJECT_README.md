@@ -19,6 +19,12 @@ A comprehensive jellyfish tracking system with configurable object detection, in
 - **Smart Assignment**: Uses expected counts to improve tracking accuracy
 - **Multi-Pass Pipeline**: Mouth → Gonads → Tentacle Bulbs
 
+### Object Permanence
+- Mouth detections create a smoothed reference point; gonad and bulb detections must stay outside the configurable `mouth_exclusion_radius` and within their own `track_search_radius` to be considered valid.
+- Each object type can define both `search_radius` (relative to the mouth) and `track_search_radius` (relative to its own history), which keeps reassociation local and prevents identity swapping.
+- After mouth components are claimed, those connected components are removed from the candidate pool so gonads and bulbs cannot reuse the same blob within the same frame.
+- Detections are scored for every object type (shape, distance, overlap penalties). A component is only claimed by an object if its score exceeds competing classes (with a configurable margin), so gonads and bulbs no longer steal each other’s regions during brief overlaps.
+
 ## 🚀 Quick Start
 
 ### Prompt Workflow (Recommended)

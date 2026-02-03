@@ -35,6 +35,13 @@ class TrackingParameters:
     bulb_max_distance: int = 30
     bulb_search_radius: int | None = None
 
+    # Object permanence controls
+    mouth_exclusion_radius: int = 30
+    temporal_smoothing_window: int = 3
+    object_priority: list[str] = field(
+        default_factory=lambda: ["mouth", "gonad", "tentacle_bulb"]
+    )
+
     # Multi-object configuration (new extensible system)
     # Object counts (user-configurable)
     num_mouths: int = 1
@@ -57,11 +64,20 @@ class TrackingParameters:
             "count": 1,  # Expected number
             "min_area": 35,
             "max_area": 160,
-            "max_disappeared": 15,
-            "max_distance": 50,
-            "search_radius": None,
-            # Shape parameters (None = no constraint)
-            "aspect_ratio_min": None,
+             "max_disappeared": 15,
+             "max_distance": 50,
+             "search_radius": None,
+             "track_search_radius": None,
+             "reference_object": None,
+             "min_distance_from_reference": None,
+             "max_jump_px": 60,
+             "ownership_radius": 50,
+             "overlap_grace_frames": 2,
+             "overlap_penalty_weight": 0.5,
+             "score_margin": 0.1,
+             "exclude_objects": {},
+              # Shape parameters (None = no constraint)
+              "aspect_ratio_min": None,
             "aspect_ratio_max": None,
             "eccentricity_min": None,
             "eccentricity_max": None,
@@ -73,10 +89,19 @@ class TrackingParameters:
             "count": 4,  # Max number to detect
             "min_area": 20,
             "max_area": 80,
-            "max_disappeared": 15,
-            "max_distance": 40,
-            "search_radius": None,
-            # Gonads are oblong - use aspect ratio filtering
+             "max_disappeared": 15,
+             "max_distance": 40,
+             "search_radius": 75,
+             "track_search_radius": 60,
+             "reference_object": "mouth",
+             "min_distance_from_reference": 25,
+             "max_jump_px": 45,
+             "ownership_radius": 40,
+             "overlap_grace_frames": 2,
+             "overlap_penalty_weight": 0.5,
+             "score_margin": 0.15,
+             "exclude_objects": {"tentacle_bulb": 20},
+              # Gonads are oblong - use aspect ratio filtering
             "aspect_ratio_min": 1.5,  # Oblong shape
             "aspect_ratio_max": 3.0,
             "eccentricity_min": 0.7,  # Elongated
@@ -89,9 +114,18 @@ class TrackingParameters:
             "count": None,  # User-specified
             "min_area": 5,
             "max_area": 35,
-            "max_disappeared": 10,
-            "max_distance": 30,
-            "search_radius": None,
+             "max_disappeared": 10,
+             "max_distance": 30,
+             "search_radius": 60,
+             "track_search_radius": 45,
+             "reference_object": "mouth",
+             "min_distance_from_reference": 10,
+             "max_jump_px": 35,
+             "ownership_radius": 35,
+             "overlap_grace_frames": 2,
+             "overlap_penalty_weight": 0.5,
+             "score_margin": 0.15,
+             "exclude_objects": {"gonad": 20},
             # Tentacle bulbs are typically round
             "aspect_ratio_min": None,
             "aspect_ratio_max": 1.5,

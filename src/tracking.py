@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+from collections import deque
 from collections.abc import Iterable as ABCIterable
 from typing import Optional, Tuple, List, Any
 from skimage.measure import label, regionprops
@@ -888,13 +889,165 @@ def run_multi_object_tracking(
             max_disappeared=config["max_disappeared"],
             max_distance=config["max_distance"]
         )
-    
+
+    smoothing_window = max(1, params.temporal_smoothing_window or 1)
+    position_history: dict[str, dict[int, deque]] = {
+        obj_type: {} for obj_type in enabled_types
+    }
+    smoothed_positions_cache: dict[str, list[tuple[float, float]]] = {
+        obj_type: [] for obj_type in enabled_types
+    }
+    position_history.setdefault("mouth", {})
+    smoothed_positions_cache.setdefault("mouth", [])
+
+    pinned_reference = params.pinned_mouth_point if params.mouth_pinned else None
+    if pinned_reference is not None:
+        smoothed_positions_cache.setdefault("mouth", []).append(pinned_reference)
+
+    def _distance(point_a: tuple[float, float], point_b: tuple[float, float]) -> float:
+        return float(np.linalg.norm(np.array(point_a) - np.array(point_b)))
+
+    def _range_score(value, minimum, maximum):
+        if value is None:
+            return 1.0
+        if minimum is None and maximum is None:
+            return 1.0
+        low = minimum if minimum is not None else value
+        high = maximum if maximum is not None else value
+        if high == low:
+            return 1.0 if value == low else 0.0
+        if value < low:
+            return max(0.0, 1.0 - (low - value) / (high - low))
+        if value > high:
+            return max(0.0, 1.0 - (value - high) / (high - low))
+        center = (low + high) / 2.0
+        half_span = (high - low) / 2.0 or 1.0
+        return max(0.1, 1.0 - abs(value - center) / half_span)
+
+    def _reset_histories() -> None:
+        for tracker in trackers.values():
+            tracker.objects.clear()
+            tracker.disappeared.clear()
+        for history_map in position_history.values():
+            history_map.clear()
+        for key in list(smoothed_positions_cache.keys()):
+            smoothed_positions_cache[key] = []
+        if pinned_reference is not None:
+            smoothed_positions_cache["mouth"] = [pinned_reference]
+
+    def _update_position_history(obj_type: str) -> None:
+        tracker = trackers[obj_type]
+        history_map = position_history[obj_type]
+        active_ids = set(tracker.objects.keys())
+        for object_id in list(history_map.keys()):
+            if object_id not in active_ids:
+                history_map.pop(object_id, None)
+        for object_id, detection in tracker.objects.items():
+            if detection is None:
+                continue
+            history = history_map.setdefault(object_id, deque(maxlen=smoothing_window))
+            history.append(detection["centroid"])
+
+    def _get_smoothed_positions(obj_type: str) -> list[tuple[float, float]]:
+        positions: list[tuple[float, float]] = []
+        for history in position_history[obj_type].values():
+            if not history:
+                continue
+            arr = np.array(history, dtype=float)
+            mean = arr.mean(axis=0)
+            positions.append((float(mean[0]), float(mean[1])))
+        return positions
+
+    def _nearest_distance(point: tuple[float, float], positions: list[tuple[float, float]]) -> float:
+        if not positions:
+            return float("inf")
+        return min(_distance(point, pos) for pos in positions)
+
+    def _get_reference_positions(name: str | None) -> list[tuple[float, float]]:
+        if not name:
+            return []
+        positions = smoothed_positions_cache.get(name, [])
+        if name == "mouth" and (not positions) and pinned_reference is not None:
+            return [pinned_reference]
+        return positions
+
+    def _compute_detection_score(obj_type: str, detection: dict, config: dict) -> float:
+        score = 1.0
+        score *= _range_score(detection.get("area"), config.get("min_area"), config.get("max_area"))
+        score *= _range_score(
+            detection.get("aspect_ratio"),
+            config.get("aspect_ratio_min"),
+            config.get("aspect_ratio_max"),
+        )
+        score *= _range_score(
+            detection.get("eccentricity"),
+            config.get("eccentricity_min"),
+            config.get("eccentricity_max"),
+        )
+        score *= _range_score(
+            detection.get("solidity"),
+            config.get("solidity_min"),
+            config.get("solidity_max"),
+        )
+
+        centroid = detection.get("centroid")
+        if centroid is None:
+            return 0.0
+
+        active_positions = smoothed_positions_cache.get(obj_type, [])
+        track_radius = config.get("track_search_radius")
+        if active_positions and track_radius:
+            dist = _nearest_distance(centroid, active_positions)
+            if dist > track_radius:
+                return 0.0
+            score *= max(0.1, 1.0 - dist / max(track_radius, 1e-6))
+        else:
+            search_radius = config.get("search_radius")
+            ref_name = config.get("reference_object")
+            if search_radius and ref_name:
+                ref_positions = _get_reference_positions(ref_name)
+                if ref_positions:
+                    dist = _nearest_distance(centroid, ref_positions)
+                    if dist > search_radius:
+                        return 0.0
+                    score *= max(0.1, 1.0 - dist / max(search_radius, 1e-6))
+
+        ownership_radius = config.get("ownership_radius")
+        if active_positions and ownership_radius:
+            dist = _nearest_distance(centroid, active_positions)
+            score *= max(0.1, 1.0 - dist / max(ownership_radius, 1e-6))
+
+        exclude_objects = config.get("exclude_objects") or {}
+        for other_type, min_distance in exclude_objects.items():
+            ref_positions = _get_reference_positions(other_type)
+            if not ref_positions or min_distance is None:
+                continue
+            dist = _nearest_distance(centroid, ref_positions)
+            if dist < min_distance:
+                penalty_weight = config.get("overlap_penalty_weight", 0.5)
+                score *= max(0.0, penalty_weight * (dist / max(min_distance, 1e-6)))
+
+        return score
+
+    def _build_priority_order() -> list[str]:
+        order: list[str] = []
+        seen: set[str] = set()
+        for name in params.object_priority:
+            if name in enabled_types and name not in seen:
+                order.append(name)
+                seen.add(name)
+        for name in enabled_types:
+            if name not in seen:
+                order.append(name)
+        return order
+
+    priority_order = _build_priority_order()
+    enabled_types = priority_order
+
     # Tracking variables
     frame_idx = 0
-    last_reference_position = None  # Used for spatial constraints
-    pinned_reference = params.pinned_mouth_point if params.mouth_pinned else None
     prev_state = bg_processor.get_state()
-    
+
     print("Processing frames...")
     
     while True:
@@ -905,19 +1058,15 @@ def run_multi_object_tracking(
         if max_frames is not None and frame_idx >= max_frames:
             break
         
-        # Background subtraction
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         diff, mask, is_ready = bg_processor.process_frame(frame_idx, gray)
         
         state = bg_processor.get_state()
         if state != prev_state:
             if state in (RotationState.ROTATING, RotationState.TRANSITION):
-                for tracker in trackers.values():
-                    tracker.objects.clear()
-                    tracker.disappeared.clear()
-                last_reference_position = None
+                _reset_histories()
             elif state == RotationState.STATIC:
-                last_reference_position = None
+                _reset_histories()
             prev_state = state
 
         if not is_ready:
@@ -926,67 +1075,75 @@ def run_multi_object_tracking(
             frame_idx += 1
             continue
 
-        if last_reference_position is not None:
-            rotated = bg_processor.rotate_point_if_needed(last_reference_position)
-            if rotated is not None:
-                last_reference_position = rotated
+        for key, positions in list(smoothed_positions_cache.items()):
+            rotated_positions: list[tuple[float, float]] = []
+            for pos in positions:
+                rotated = bg_processor.rotate_point_if_needed(pos)
+                rotated_positions.append(rotated if rotated is not None else pos)
+            smoothed_positions_cache[key] = rotated_positions
+
+        if pinned_reference is not None and not smoothed_positions_cache.get("mouth"):
+            smoothed_positions_cache["mouth"] = [pinned_reference]
 
         component_stats = compute_component_stats(mask, pixel_size_mm=pixel_size_mm)
-        remaining_components = component_stats
 
-        # Process each object type in order (mouth first as reference)
-        reference_position = None
-        if pinned_reference is not None:
-            reference_position = pinned_reference
-            last_reference_position = reference_position
-
-        for obj_type in enabled_types:
+        component_candidates: dict[str, list[dict]] = {}
+        component_scores: dict[int, dict[str, float]] = {}
+        for obj_type in priority_order:
             config = params.get_object_config(obj_type)
             if config is None:
                 continue
-                
-            # Detect objects with shape filtering
             detections = detect_objects_with_shape_filtering(
                 None,
                 config,
                 pixel_size_mm,
-                components=remaining_components,
+                components=component_stats,
             )
-            
-            # Apply spatial constraints if we have a reference position
-            # (usually mouth, used to constrain gonad/bulb detection)
-            if (config.get("search_radius") is not None and 
-                last_reference_position is not None and 
-                obj_type != "mouth"):  # Don't constrain mouth detection
-                
-                detections = [
-                    d for d in detections
-                    if np.linalg.norm(
-                        np.array(d["centroid"]) - np.array(last_reference_position)
-                    ) <= config["search_radius"]
-                ]
-            
-            # Update tracker
-            trackers[obj_type].update(detections)
+            scored: list[dict] = []
+            for det in detections:
+                candidate = det.copy()
+                score = _compute_detection_score(obj_type, candidate, config)
+                if score <= 0:
+                    continue
+                candidate["score"] = score
+                comp_id = candidate.get("component_id")
+                if comp_id is not None:
+                    component_scores.setdefault(comp_id, {})[obj_type] = score
+                scored.append(candidate)
+            component_candidates[obj_type] = scored
 
-            used_component_ids = {
-                d.get("component_id")
-                for d in detections
-                if d.get("component_id") is not None
-            }
-            if used_component_ids:
-                remaining_components = [
-                    comp
-                    for comp in remaining_components
-                    if comp.get("component_id") not in used_component_ids
-                ]
-            
-            # Use mouth as reference position for other objects
-            if obj_type == "mouth" and trackers[obj_type].objects:
-                # Use the first (and typically only) mouth object as reference
-                first_mouth = next(iter(trackers[obj_type].objects.values()))
-                reference_position = first_mouth["centroid"]
-                last_reference_position = reference_position
+        claimed_components: set[int] = set()
+        for obj_type in priority_order:
+            config = params.get_object_config(obj_type)
+            if config is None:
+                continue
+            detections: list[dict] = []
+            score_margin = config.get("score_margin", 0.0) or 0.0
+            for det in component_candidates.get(obj_type, []):
+                comp_id = det.get("component_id")
+                if comp_id is not None and comp_id in claimed_components:
+                    continue
+                comp_map = component_scores.get(comp_id, {}) if comp_id is not None else {}
+                if comp_map:
+                    best_type, best_score = max(comp_map.items(), key=lambda kv: kv[1])
+                    if best_type != obj_type:
+                        current_score = det["score"]
+                        if best_score >= current_score * (1.0 + score_margin):
+                            continue
+                detections.append(det)
+
+            trackers[obj_type].update(detections)
+            _update_position_history(obj_type)
+            smoothed_positions_cache[obj_type] = _get_smoothed_positions(obj_type)
+            if obj_type == "mouth" and not smoothed_positions_cache[obj_type] and pinned_reference is not None:
+                smoothed_positions_cache["mouth"] = [pinned_reference]
+
+            for detection in trackers[obj_type].objects.values():
+                if detection is None:
+                    continue
+                comp_id = detection.get("component_id")
+                if comp_id is not None:
+                    claimed_components.add(comp_id)
         
         frame_idx += 1
         
