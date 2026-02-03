@@ -1,652 +1,617 @@
 from __future__ import annotations
 
+import math
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
 import cv2
 import numpy as np
-from dataclasses import dataclass
-from typing import List, Tuple, Dict, Optional
-
 import click
 from skimage.measure import regionprops
 
 from .tracker import TrackingParameters
+from .tracking import get_roi_mask_for_video
 
-FULL_WEIGHT_SAMPLES = 5
-MIN_MOUTH_SAMPLES = 1
+
+# Valid feature labels for annotation
+FEATURE_TYPES = ("mouth", "gonad", "tentacle_bulb")
+AREA_MARGIN = 0.3
+ASPECT_MARGIN = 0.2
+ECCENTRICITY_MARGIN = 0.1
+SOLIDITY_MARGIN = 0.1
+SEARCH_RADIUS_MARGIN = 1.5
+THRESHOLD_BUFFER = 2
 
 
 @dataclass
-class SampledFeature:
-    object_type: str
+class FeatureSample:
+    feature_type: str
+    frame_idx: int
     centroid: Tuple[float, float]
     area: float
+    bbox: Tuple[int, int, int, int]
     aspect_ratio: float
     eccentricity: float
     solidity: float
-    major_axis_length_mm: float
-    minor_axis_length_mm: float
 
 
-@dataclass
-class AnnotationRegion:
-    feature_type: str
-    frame_idx: int
-    points: List[Tuple[float, float]]
-    shape: str = "polygon"
-    circle_center: Tuple[float, float] | None = None
-    circle_radius: float | None = None
-
-
-def compute_median_frame(
+def compute_median_background(
     video_path: str,
-    sample_count: int = 200,
+    num_samples: int = 60,
     max_frames: Optional[int] = None,
-) -> np.ndarray:
+) -> Tuple[np.ndarray, int, int, int]:
+    """Compute a simple median background from evenly spaced frames."""
+
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise ValueError(f"Could not open video: {video_path}")
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
-    if max_frames is not None and total_frames:
-        total_frames = min(total_frames, max_frames)
-    if total_frames <= 0:
-        cap.release()
+    if total_frames == 0:
         raise ValueError("Video contains no frames")
 
-    indices = np.linspace(0, total_frames - 1, min(sample_count, total_frames)).astype(int)
-    samples: List[np.ndarray] = []
+    if max_frames is not None:
+        total_frames = min(total_frames, max_frames)
+
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+
+    num_samples = min(num_samples, total_frames)
+    indices = np.linspace(0, total_frames - 1, num_samples).astype(int)
+
+    sample_stack: List[np.ndarray] = []
     for idx in indices:
         cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
         ret, frame = cap.read()
         if not ret:
             continue
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        samples.append(gray.astype(np.float32))
+        sample_stack.append(gray.astype(np.float32))
 
     cap.release()
-    if not samples:
-        raise ValueError("Unable to compute median frame")
 
-    median_frame = np.median(np.stack(samples, axis=0), axis=0).astype(np.uint8)
-    return median_frame
+    if not sample_stack:
+        raise ValueError("Unable to compute median background")
+
+    median_bg = np.median(np.stack(sample_stack, axis=0), axis=0).astype(np.uint8)
+    return median_bg, width, height, int(fps)
 
 
-class FeatureAnnotationApp:
+def _extract_feature_sample(
+    component_mask: np.ndarray,
+    feature_type: str,
+    frame_idx: int,
+) -> FeatureSample | None:
+    props = regionprops(component_mask.astype(np.uint8))
+    if not props:
+        return None
+    region = props[0]
+    min_row, min_col, max_row, max_col = region.bbox
+    bbox = (
+        int(min_col),
+        int(min_row),
+        int(max_col - min_col),
+        int(max_row - min_row),
+    )
+    aspect_ratio = (
+        float(region.axis_major_length / region.axis_minor_length)
+        if region.axis_minor_length > 0
+        else float("inf")
+    )
+
+    return FeatureSample(
+        feature_type=feature_type,
+        frame_idx=frame_idx,
+        centroid=(float(region.centroid[1]), float(region.centroid[0])),
+        area=float(region.area),
+        bbox=bbox,
+        aspect_ratio=aspect_ratio,
+        eccentricity=float(region.eccentricity),
+        solidity=float(region.solidity),
+    )
+
+
+class FeatureSamplingUI:
     def __init__(
         self,
         video_path: str,
         params: TrackingParameters,
-        pixel_size_mm: float,
+        max_frames: Optional[int] = None,
     ) -> None:
         self.video_path = video_path
         self.params = params
-        self.pixel_size_mm = pixel_size_mm
+        self.max_frames = max_frames
+
+        self.background, self.width, self.height, _ = compute_median_background(
+            video_path, max_frames=max_frames
+        )
+
         self.cap = cv2.VideoCapture(video_path)
         if not self.cap.isOpened():
             raise ValueError(f"Could not open video: {video_path}")
 
         self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
-        self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if self.max_frames is not None:
+            self.total_frames = min(self.total_frames, self.max_frames)
+
         self.current_frame_idx = 0
-        self.current_frame: np.ndarray | None = None
-        self.current_diff: np.ndarray | None = None
-        self.show_diff = True
+        self.gray_frame: np.ndarray | None = None
+        self.color_frame: np.ndarray | None = None
+        self.diff: np.ndarray | None = None
+        self.mask: np.ndarray | None = None
+        self.labels: np.ndarray | None = None
+
+        self.video_type = getattr(params, "video_type", "non_rotating") or "non_rotating"
+        self.roi_mask = get_roi_mask_for_video(params, self.height, self.width, self.video_type)
+
+        self.threshold_value = max(0, min(255, int(params.threshold)))
+
+        self.mouth_pinned = params.mouth_pinned
+        self.available_features = [
+            ft for ft in FEATURE_TYPES if not (self.mouth_pinned and ft == "mouth")
+        ]
+        if not self.available_features:
+            self.available_features = ["gonad"]
+        self.current_feature = self.available_features[0]
+        self.samples: Dict[str, List[FeatureSample]] = {ft: [] for ft in FEATURE_TYPES}
+        self.status_message = "Click red regions to label features"
+        self._display_shape: tuple[int, int] = (self.width * 3, self.height)
+        self._cursor_screen_pos: tuple[int, int] | None = None
+        self._cursor_image_pos: tuple[int, int] | None = None
+        self._cursor_mask_value: int | None = None
+
+        self.window_name = "Feature Sampling"
+        cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+        cv2.setMouseCallback(self.window_name, self._handle_mouse)
+        cv2.createTrackbar(
+            "Threshold",
+            self.window_name,
+            self.threshold_value,
+            255,
+            self._handle_trackbar,
+        )
+
         self.zoom = 1.0
         self.pan_x = 0
         self.pan_y = 0
-        self.window_name = "Feature Annotation"
-        self.current_points: List[Tuple[float, float]] = []
-        self.current_feature = "mouth"
-        self.annotations: List[AnnotationRegion] = []
-        self.status_message = "Polygon mode: click to add vertices, Enter to finalize"
-        self.median_frame = compute_median_frame(video_path)
-        self.drawing_mode = "polygon"  # or "circle"
-        self.circle_center: Tuple[float, float] | None = None
-        self.circle_radius: float | None = None
-        self.is_drawing_circle = False
-        self.threshold_options = [5, 10, 15, 20, 30, 40, 60, 80]
-        if params.threshold not in self.threshold_options:
-            self.threshold_options.append(params.threshold)
-            self.threshold_options = sorted(set(self.threshold_options))
-        self.threshold_index = max(
-            0,
-            self.threshold_options.index(
-                min(self.threshold_options, key=lambda t: abs(t - params.threshold))
-            ),
-        )
 
-        cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
-        cv2.setMouseCallback(self.window_name, self._mouse_callback)
+        self._load_frame(0)
 
-    def _read_frame(self, idx: int) -> bool:
-        if idx < 0 or idx >= self.total_frames:
-            return False
+    @property
+    def threshold(self) -> int:
+        return int(self.threshold_value)
+
+    def _handle_trackbar(self, value: int) -> None:  # pragma: no cover - UI callback
+        self.threshold_value = value
+        self.params.threshold = self.threshold
+        self._update_diff()
+        self.status_message = f"Threshold set to {self.threshold}"
+
+    def _load_frame(self, idx: int) -> None:
+        idx = max(0, min(idx, self.total_frames - 1))
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
         ret, frame = self.cap.read()
         if not ret:
-            return False
+            raise RuntimeError("Unable to read frame for sampling")
+
         self.current_frame_idx = idx
-        self.current_frame = frame
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        diff = cv2.absdiff(gray, self.median_frame)
-        norm_diff = np.zeros_like(diff, dtype=np.uint8)
-        cv2.normalize(diff, dst=norm_diff, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX)
-        self.current_diff = cv2.applyColorMap(norm_diff, cv2.COLORMAP_MAGMA)
-        self.current_points.clear()
-        self.circle_center = None
-        self.circle_radius = None
-        self.is_drawing_circle = False
-        return True
+        self.color_frame = frame
+        self.gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        self._update_diff()
 
-    def _apply_zoom_pan(self, img: np.ndarray) -> np.ndarray:
-        h, w = img.shape[:2]
-        if self.zoom <= 1.0:
-            self.pan_x = 0
-            self.pan_y = 0
-            return img
-        scaled = cv2.resize(img, None, fx=self.zoom, fy=self.zoom, interpolation=cv2.INTER_LINEAR)
-        view_w, view_h = w, h
-        max_x = max(0, scaled.shape[1] - view_w)
-        max_y = max(0, scaled.shape[0] - view_h)
-        self.pan_x = int(min(max(self.pan_x, 0), max_x))
-        self.pan_y = int(min(max(self.pan_y, 0), max_y))
-        return scaled[self.pan_y : self.pan_y + view_h, self.pan_x : self.pan_x + view_w]
+    def _update_diff(self) -> None:
+        if self.gray_frame is None:
+            return
+        diff = cv2.absdiff(self.gray_frame, self.background)
+        if self.roi_mask is not None:
+            diff = cv2.bitwise_and(diff, self.roi_mask)
+        _, mask = cv2.threshold(diff, self.threshold, 255, cv2.THRESH_BINARY)
+        self.diff = diff
+        self.mask = mask
+        if np.count_nonzero(mask) > 0:
+            labels = cv2.connectedComponentsWithStats(mask, connectivity=8)
+            self.labels = labels[1]
+        else:
+            self.labels = None
 
-    def _map_display_to_image(self, x: int, y: int) -> Tuple[int, int]:
-        if self.zoom <= 1.0:
-            return x, y
-        return int((self.pan_x + x) / self.zoom), int((self.pan_y + y) / self.zoom)
+    def _handle_mouse(self, event, x, y, flags, param):  # pragma: no cover - UI callback
+        self._cursor_screen_pos = (x, y)
+        image_coords = self._map_screen_to_image_coords(x, y)
+
+        if image_coords is None:
+            self._cursor_image_pos = None
+            self._cursor_mask_value = None
+            if event == cv2.EVENT_LBUTTONDOWN:
+                self.status_message = "Click inside the diff pane (right side)"
+            return
+
+        local_x, local_y = image_coords
+        self._cursor_image_pos = (local_x, local_y)
+        if self.mask is not None:
+            self._cursor_mask_value = int(self.mask[local_y, local_x])
+        else:
+            self._cursor_mask_value = None
+
+        if event == cv2.EVENT_LBUTTONDOWN:
+            self._label_component(local_x, local_y)
+
+    def _label_component(self, local_x: int, local_y: int) -> None:
+        if self.mask is None or self.labels is None:
+            self.status_message = "Diff mask not ready"
+            return
+        if local_x < 0 or local_x >= self.width or local_y < 0 or local_y >= self.height:
+            return
+        if self.mask[local_y, local_x] == 0:
+            self.status_message = "Clicked region is below threshold"
+            return
+
+        label_id = int(self.labels[local_y, local_x])
+        if label_id <= 0:
+            self.status_message = "Clicked background"
+            return
+
+        component_mask = (self.labels == label_id).astype(np.uint8)
+        sample = _extract_feature_sample(component_mask, self.current_feature, self.current_frame_idx)
+        if sample is None:
+            self.status_message = "Unable to measure selected region"
+            return
+
+        self.samples[self.current_feature].append(sample)
+        self.status_message = f"Added {self.current_feature} sample (area={sample.area:.0f})"
+
+    def _map_screen_to_image_coords(self, screen_x: int, screen_y: int) -> tuple[int, int] | None:
+        if not hasattr(self, "_last_crop"):
+            return None
+
+        display_width, display_height = self._get_window_size()
+        stacked_width = self.width * 3
+        stacked_height = self.height
+
+        array_x = int(screen_x * stacked_width / max(1, display_width))
+        array_y = int(screen_y * stacked_height / max(1, display_height))
+
+        pan_x, pan_y, view_width, view_height = self._last_crop
+
+        orig_x = pan_x + (array_x * view_width / stacked_width)
+        orig_y = pan_y + (array_y * view_height / stacked_height)
+
+        if orig_x < 2 * self.width or orig_x >= 3 * self.width:
+            return None
+        if orig_y < 0 or orig_y >= self.height:
+            return None
+
+        local_x = int(orig_x - 2 * self.width)
+        local_y = int(orig_y)
+        local_x = max(0, min(self.width - 1, local_x))
+        local_y = max(0, min(self.height - 1, local_y))
+        return local_x, local_y
+
+    def _image_to_display_coords(self, local_x: int, local_y: int) -> tuple[int, int] | None:
+        if not hasattr(self, "_last_crop"):
+            return None
+        pan_x, pan_y, view_width, view_height = self._last_crop
+        stacked_width = self.width * 3
+        stacked_height = self.height
+
+        orig_x = local_x + 2 * self.width
+        orig_y = local_y
+
+        if not (pan_x <= orig_x < pan_x + view_width):
+            return None
+        if not (pan_y <= orig_y < pan_y + view_height):
+            return None
+
+        array_x = int(((orig_x - pan_x) * stacked_width) / view_width)
+        array_y = int(((orig_y - pan_y) * stacked_height) / view_height)
+        array_x = max(0, min(self._display_shape[0] - 1, array_x))
+        array_y = max(0, min(self._display_shape[1] - 1, array_y))
+        return array_x, array_y
+
+    def _get_window_size(self) -> tuple[int, int]:
+        display_width, display_height = self._display_shape
+        try:
+            rect = cv2.getWindowImageRect(self.window_name)
+            if rect[2] > 0 and rect[3] > 0:
+                display_width = rect[2]
+                display_height = rect[3]
+        except Exception:  # pragma: no cover - OpenCV may not support this call
+            pass
+        return display_width, display_height
+
+    def _cycle_threshold(self, step: int = 5) -> None:
+        self.threshold_value = max(0, min(255, self.threshold_value + step))
+        cv2.setTrackbarPos("Threshold", self.window_name, self.threshold_value)
+        self.params.threshold = self.threshold
+        self._update_diff()
+        self.status_message = f"Threshold set to {self.threshold}"
+
+    def _compose_display(self) -> np.ndarray:
+        if self.gray_frame is None or self.diff is None or self.mask is None:
+            return np.zeros((self.height, self.width * 3, 3), dtype=np.uint8)
+
+        raw = cv2.cvtColor(self.gray_frame, cv2.COLOR_GRAY2BGR)
+        bg = cv2.cvtColor(self.background, cv2.COLOR_GRAY2BGR)
+        diff_display = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+        diff_display[self.mask > 0] = (0, 0, 255)
+
+        self._draw_annotations(raw)
+        stacked = np.hstack([raw, bg, diff_display])
+        view, crop_metadata = self._apply_zoom_pan(stacked)
+        self._last_crop = crop_metadata
+        self._display_shape = (view.shape[1], view.shape[0])
+
+        overlay = view.copy()
+        cv2.rectangle(overlay, (0, 0), (overlay.shape[1], 110), (0, 0, 0), -1)
+        blended = cv2.addWeighted(overlay, 0.4, view, 0.6, 0)
+
+        def _draw_text(img, text, pos, color):
+            cv2.putText(img, text, pos, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3)
+            cv2.putText(img, text, pos, cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1)
+
+        status_text = (
+            f"Frame {self.current_frame_idx + 1}/{self.total_frames} | Feature: {self.current_feature.upper()}"
+            f" | Threshold: {self.threshold}"
+        )
+        _draw_text(blended, status_text, (10, 35), (0, 255, 255))
+        cursor_info = ""
+        if self._cursor_mask_value is not None:
+            cursor_info = f" | Mask:{self._cursor_mask_value}"
+        _draw_text(blended, self.status_message + cursor_info, (10, 65), (255, 255, 255))
+        feature_keys = "/".join(ft[0] for ft in self.available_features)
+        instructions = (
+            f"{feature_keys} change feature | n/p frame | slider/b threshold | +/- zoom | arrows pan | u undo | c clear | q quit"
+        )
+        _draw_text(blended, instructions, (10, 95), (173, 255, 47))
+
+        if self._cursor_image_pos is not None:
+            display_coords = self._image_to_display_coords(*self._cursor_image_pos)
+            if display_coords is not None:
+                cv2.drawMarker(
+                    blended,
+                    display_coords,
+                    (0, 255, 0),
+                    markerType=cv2.MARKER_CROSS,
+                    markerSize=12,
+                    thickness=2,
+                )
+
+        return blended
+
+    def _apply_zoom_pan(
+        self, stacked: np.ndarray
+    ) -> tuple[np.ndarray, tuple[int, int, int, int]]:
+        zoom = max(1.0, min(self.zoom, 5.0))
+        view_width = int(stacked.shape[1] / zoom)
+        view_height = int(stacked.shape[0] / zoom)
+        view_width = max(1, min(view_width, stacked.shape[1]))
+        view_height = max(1, min(view_height, stacked.shape[0]))
+
+        max_x = stacked.shape[1] - view_width
+        max_y = stacked.shape[0] - view_height
+        self.pan_x = max(0, min(int(self.pan_x), max_x))
+        self.pan_y = max(0, min(int(self.pan_y), max_y))
+
+        crop = stacked[
+            self.pan_y : self.pan_y + view_height,
+            self.pan_x : self.pan_x + view_width,
+        ]
+        resized = cv2.resize(
+            crop,
+            (stacked.shape[1], stacked.shape[0]),
+            interpolation=cv2.INTER_LINEAR,
+        )
+        return resized, (self.pan_x, self.pan_y, view_width, view_height)
+
+    def _adjust_zoom(self, factor: float) -> None:
+        center_x = self.pan_x + int((self.width * 1.5) / self.zoom)
+        center_y = self.pan_y + int((self.height) / self.zoom)
+        self.zoom = max(1.0, min(5.0, self.zoom * factor))
+        view_width = int((self.width * 3) / self.zoom)
+        view_height = int(self.height / self.zoom)
+        self.pan_x = center_x - view_width // 2
+        self.pan_y = center_y - view_height // 2
+
+    def _pan(self, dx: int, dy: int) -> None:
+        self.pan_x += dx
+        self.pan_y += dy
 
     def _draw_annotations(self, canvas: np.ndarray) -> None:
-        for region in self.annotations:
-            if region.frame_idx != self.current_frame_idx:
-                continue
-            color = self._color_for_type(region.feature_type)
-            if region.shape == "circle" and region.circle_center and region.circle_radius:
-                c = (int(round(region.circle_center[0])), int(round(region.circle_center[1])))
-                r = max(1, int(round(region.circle_radius)))
-                cv2.circle(canvas, c, r, color, 2)
-                cv2.circle(canvas, c, 4, color, -1)
-                cv2.putText(canvas, region.feature_type[0].upper(), (c[0] + 5, c[1] - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-            else:
-                pts = np.array(region.points, dtype=np.int32)
-                if pts.size == 0:
-                    continue
-                cv2.polylines(canvas, [pts], True, color, 2)
-                mask = np.zeros((self.height, self.width), dtype=np.uint8)
-                cv2.fillPoly(mask, [pts], 255)
-                moments = cv2.moments(mask)
-                if moments["m00"]:
-                    cx = int(moments["m10"] / moments["m00"])
-                    cy = int(moments["m01"] / moments["m00"])
-                    cv2.circle(canvas, (cx, cy), 4, color, -1)
-                    cv2.putText(canvas, region.feature_type[0].upper(), (cx + 5, cy - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+        for feature, samples in self.samples.items():
+            color = {
+                "mouth": (0, 165, 255),
+                "gonad": (255, 0, 255),
+                "tentacle_bulb": (255, 200, 0),
+            }.get(feature, (255, 255, 255))
+            for sample in samples:
+                x, y = int(sample.centroid[0]), int(sample.centroid[1])
+                cv2.circle(canvas, (x, y), 4, color, -1)
+                cv2.putText(
+                    canvas,
+                    feature[0].upper(),
+                    (x + 5, y - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    color,
+                    1,
+                )
+        self._draw_roi(canvas)
 
-        if self.drawing_mode == "polygon" and self.current_points:
-            pts = np.array(self.current_points, dtype=np.int32)
-            color = self._color_for_type(self.current_feature)
-            cv2.polylines(canvas, [pts], False, color, 1)
-            for point in self.current_points:
-                cv2.circle(canvas, (int(point[0]), int(point[1])), 3, color, -1)
-        elif self.drawing_mode == "circle" and self.circle_center is not None and self.circle_radius is not None:
-            color = self._color_for_type(self.current_feature)
-            c = (int(round(self.circle_center[0])), int(round(self.circle_center[1])))
-            r = max(1, int(round(self.circle_radius)))
-            cv2.circle(canvas, c, r, color, 1)
-            cv2.circle(canvas, c, 3, color, -1)
-            cv2.putText(canvas, f"r={r}px", (c[0] + 5, c[1] + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
-
-    @staticmethod
-    def _color_for_type(feature_type: str) -> Tuple[int, int, int]:
-        return {
-            "mouth": (0, 165, 255),
-            "gonad": (255, 0, 255),
-            "tentacle_bulb": (0, 255, 255),
-        }.get(feature_type, (255, 255, 255))
-
-    def _render(self) -> None:
-        if self.current_frame is None:
-            return
-        base = self.current_diff if self.show_diff and self.current_diff is not None else self.current_frame
-        canvas = base.copy()
-        self._draw_annotations(canvas)
-        overlay = canvas
-        if self.zoom > 1.0:
-            overlay = self._apply_zoom_pan(canvas)
-        cv2.putText(
-            overlay,
-            f"Frame {self.current_frame_idx + 1}/{self.total_frames} | Feature: {self.current_feature.upper()} | Zoom: {self.zoom:.1f}",
-            (10, 25),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (255, 255, 255),
-            2,
-        )
-        hud_lines = [
-            self.status_message,
-            f"Threshold: {self.params.threshold}px (press 'b' to cycle)",
-            "Controls: m/g/t switch feature | o toggle circle mode",
-            "Click to add vertices (polygon) or click+drag (circle)",
-            "+/− zoom | h/j/k/l pan | d diff/raw | Enter finalize polygon | u undo | c clear | q quit",
-        ]
-        y = 50
-        for line in hud_lines:
-            cv2.putText(
-                overlay,
-                line,
-                (10, y),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                (255, 255, 0),
-                1,
+    def _draw_roi(self, canvas: np.ndarray) -> None:
+        roi_params = self.params.get_roi_params()
+        mode = roi_params.get("mode", "auto")
+        if mode == "circle" and roi_params.get("center") and roi_params.get("radius"):
+            center = tuple(map(int, map(round, roi_params["center"])))
+            radius = max(int(round(roi_params["radius"])), 1)
+            cv2.circle(canvas, center, radius, (128, 128, 128), 2)
+        elif mode == "polygon" and roi_params.get("points"):
+            pts = np.array(
+                [tuple(int(round(v)) for v in pt) for pt in roi_params["points"]],
+                dtype=np.int32,
             )
-            y += 20
-        cv2.imshow(self.window_name, overlay)
+            cv2.polylines(canvas, [pts], True, (128, 128, 128), 2)
+        elif self.video_type == "rotating":
+            center = (self.width // 2, self.height // 2)
+            radius = min(self.width, self.height) // 2
+            cv2.circle(canvas, center, radius, (128, 128, 128), 1)
 
-    def _mouse_callback(self, event, x, y, flags, param) -> None:
-        if self.drawing_mode == "circle":
-            self._circle_mouse(event, x, y)
-            return
-        if event == cv2.EVENT_LBUTTONDOWN:
-            px, py = self._map_display_to_image(x, y)
-            self.current_points.append((float(px), float(py)))
+    def _change_feature(self, feature: str) -> None:
+        if feature in self.available_features:
+            self.current_feature = feature
+            self.status_message = f"Feature: {feature}"
+        else:
+            self.status_message = f"Feature '{feature}' disabled"
 
-    def _circle_mouse(self, event, x, y) -> None:
-        px, py = self._map_display_to_image(x, y)
-        if event == cv2.EVENT_LBUTTONDOWN:
-            self.circle_center = (float(px), float(py))
-            self.circle_radius = 0.0
-            self.is_drawing_circle = True
-        elif event == cv2.EVENT_MOUSEMOVE and self.is_drawing_circle and self.circle_center is not None:
-            dx = px - self.circle_center[0]
-            dy = py - self.circle_center[1]
-            self.circle_radius = float(np.hypot(dx, dy))
-        elif event == cv2.EVENT_LBUTTONUP and self.is_drawing_circle and self.circle_center is not None:
-            dx = px - self.circle_center[0]
-            dy = py - self.circle_center[1]
-            self.circle_radius = float(np.hypot(dx, dy))
-            self.is_drawing_circle = False
-            self._finalize_circle()
+    def _undo(self) -> None:
+        samples = self.samples[self.current_feature]
+        if samples:
+            samples.pop()
+            self.status_message = "Removed last sample"
+        else:
+            self.status_message = "No samples to remove"
 
-    def _finalize_polygon(self) -> None:
-        if len(self.current_points) < 3:
-            self.status_message = "Need at least three points"
-            return
-        region = AnnotationRegion(
-            feature_type=self.current_feature,
-            frame_idx=self.current_frame_idx,
-            points=self.current_points.copy(),
-            shape="polygon",
-        )
-        self.annotations.append(region)
-        self.current_points.clear()
-        self.status_message = f"Added {region.feature_type} annotation"
+    def _clear_feature(self) -> None:
+        self.samples[self.current_feature].clear()
+        self.status_message = f"Cleared {self.current_feature} samples"
 
-    def _finalize_circle(self) -> None:
-        if self.circle_center is None or self.circle_radius is None or self.circle_radius < 1.0:
-            self.status_message = "Circle radius too small"
-            self.circle_center = None
-            self.circle_radius = None
-            return
-        region = AnnotationRegion(
-            feature_type=self.current_feature,
-            frame_idx=self.current_frame_idx,
-            points=[],
-            shape="circle",
-            circle_center=self.circle_center,
-            circle_radius=self.circle_radius,
-        )
-        self.annotations.append(region)
-        self.circle_center = None
-        self.circle_radius = None
-        self.status_message = "Circle annotation added"
-
-    def _remove_last_annotation(self) -> None:
-        for idx in range(len(self.annotations) - 1, -1, -1):
-            if self.annotations[idx].feature_type == self.current_feature and self.annotations[idx].frame_idx == self.current_frame_idx:
-                self.annotations.pop(idx)
-                self.status_message = "Removed last annotation"
-                return
-        self.status_message = "No annotation to remove"
-
-    def run(self) -> List[AnnotationRegion]:
-        if not self._read_frame(0):
-            raise RuntimeError("Unable to read first frame")
-
+    def run(self) -> Dict[str, List[FeatureSample]]:
         while True:
-            self._render()
-            key = cv2.waitKey(20) & 0xFF
+            display = self._compose_display()
+            cv2.imshow(self.window_name, display)
+            key = cv2.waitKey(30) & 0xFF
             if key == 255:
                 continue
             if key == ord("q"):
                 break
-            elif key == ord("d"):
-                self.show_diff = not self.show_diff
+            if key == ord("b"):
+                self._cycle_threshold(step=5)
+            elif key == ord("B"):
+                self._cycle_threshold(step=-5)
             elif key == ord("m"):
-                self.current_feature = "mouth"
-                self.status_message = "Feature: mouth"
+                if self.mouth_pinned:
+                    self.status_message = "Mouth annotations disabled (pinned mode)"
+                else:
+                    self._change_feature("mouth")
             elif key == ord("g"):
-                self.current_feature = "gonad"
-                self.status_message = "Feature: gonad"
+                self._change_feature("gonad")
             elif key == ord("t"):
-                self.current_feature = "tentacle_bulb"
-                self.status_message = "Feature: tentacle bulb"
-            elif key == ord("o"):
-                if self.drawing_mode == "polygon":
-                    self.drawing_mode = "circle"
-                    self.current_points.clear()
-                    self.status_message = "Circle mode: click and drag to define radius"
-                else:
-                    self.drawing_mode = "polygon"
-                    self.circle_center = None
-                    self.circle_radius = None
-                    self.is_drawing_circle = False
-                    self.status_message = "Polygon mode: click to add vertices"
-            elif key == ord("b"):
-                self._cycle_threshold()
-            elif key in (ord("+"), ord("=")):
-                self.zoom = min(self.zoom + 0.25, 5.0)
-            elif key == ord("-"):
-                self.zoom = max(1.0, self.zoom - 0.25)
-            elif key == ord("h"):
-                self.pan_x = max(self.pan_x - 40, 0)
-            elif key == ord("l"):
-                self.pan_x += 40
-            elif key == ord("k"):
-                self.pan_y = max(self.pan_y - 40, 0)
-            elif key == ord("j"):
-                self.pan_y += 40
+                self._change_feature("tentacle_bulb")
             elif key in (ord("n"), ord("]")):
-                self._read_frame(min(self.current_frame_idx + 1, self.total_frames - 1))
+                self._load_frame(self.current_frame_idx + 1)
             elif key in (ord("p"), ord("[")):
-                self._read_frame(max(self.current_frame_idx - 1, 0))
-            elif key == 13:  # Enter
-                if self.drawing_mode == "polygon":
-                    self._finalize_polygon()
-            elif key in (ord("u"), 8):
-                if self.drawing_mode == "polygon":
-                    if self.current_points:
-                        self.current_points.pop()
-                    else:
-                        self._remove_last_annotation()
-                else:
-                    if self.is_drawing_circle:
-                        self.circle_center = None
-                        self.circle_radius = None
-                        self.is_drawing_circle = False
-                    else:
-                        self._remove_last_annotation()
+                self._load_frame(self.current_frame_idx - 1)
+            elif key in (ord("+"), ord("=")):
+                self._adjust_zoom(1.2)
+            elif key == ord("-"):
+                self._adjust_zoom(0.8)
+            elif key in (ord("h"), ord("a")):
+                self._pan(-40, 0)
+            elif key in (ord("l"), ord("d")):
+                self._pan(40, 0)
+            elif key in (ord("k"), ord("w")):
+                self._pan(0, -40)
+            elif key in (ord("j"), ord("s")):
+                self._pan(0, 40)
+            elif key == ord("u"):
+                self._undo()
             elif key == ord("c"):
-                if self.drawing_mode == "polygon":
-                    self.current_points.clear()
-                else:
-                    self.circle_center = None
-                    self.circle_radius = None
-                    self.is_drawing_circle = False
+                self._clear_feature()
 
         cv2.destroyWindow(self.window_name)
         self.cap.release()
-        return self.annotations
-
-    def _cycle_threshold(self) -> None:
-        """Cycle through predefined threshold options."""
-
-        if not self.threshold_options:
-            return
-        self.threshold_index = (self.threshold_index + 1) % len(self.threshold_options)
-        self.params.threshold = int(self.threshold_options[self.threshold_index])
-        self.status_message = f"Threshold set to {self.params.threshold}px"
+        self.params.threshold = self.threshold
+        return self.samples
 
 
-def _annotations_to_samples(
-    annotations: List[AnnotationRegion],
-    frame_shape: Tuple[int, int],
-    pixel_size_mm: float,
-) -> List[SampledFeature]:
-    samples: List[SampledFeature] = []
-    height, width = frame_shape
-    for region in annotations:
-        mask = np.zeros((height, width), dtype=np.uint8)
-        if region.shape == "circle" and region.circle_center and region.circle_radius:
-            center = (int(round(region.circle_center[0])), int(round(region.circle_center[1])))
-            radius = max(1, int(round(region.circle_radius)))
-            cv2.circle(mask, center, radius, 255, -1)
-        else:
-            pts = np.array(region.points, dtype=np.int32)
-            if pts.size == 0:
-                continue
-            cv2.fillPoly(mask, [pts], 255)
-        props = regionprops(mask)
-        if not props:
-            continue
-        prop = props[0]
-        aspect_ratio = prop.axis_major_length / prop.axis_minor_length if prop.axis_minor_length > 0 else 1.0
-        samples.append(
-            SampledFeature(
-                object_type=region.feature_type,
-                centroid=(prop.centroid[1], prop.centroid[0]),
-                area=float(prop.area),
-                aspect_ratio=float(aspect_ratio),
-                eccentricity=float(prop.eccentricity),
-                solidity=float(prop.solidity),
-                major_axis_length_mm=float(prop.axis_major_length * pixel_size_mm),
-                minor_axis_length_mm=float(prop.axis_minor_length * pixel_size_mm),
-            )
-        )
-    return samples
-
-
-def _count_samples(samples: List[SampledFeature]) -> Dict[str, int]:
-    counts: Dict[str, int] = {}
-    for sample in samples:
-        counts[sample.object_type] = counts.get(sample.object_type, 0) + 1
-    return counts
-
-
-def _validate_samples(samples: List[SampledFeature], params: TrackingParameters) -> None:
-    counts = _count_samples(samples)
-    mouth_count = counts.get("mouth", 0)
-    if mouth_count < MIN_MOUTH_SAMPLES:
-        raise click.ClickException("Please annotate at least one mouth region before continuing.")
-    warnings = []
-    if params.num_gonads and counts.get("gonad", 0) == 0:
-        warnings.append("No gonad annotations detected; using default gonad parameters.")
-    if params.num_tentacle_bulbs and counts.get("tentacle_bulb", 0) == 0:
-        warnings.append("No tentacle bulb annotations detected; using default bulb parameters.")
-    for msg in warnings:
-        click.echo(f"Warning: {msg}")
-
-
-def _blend_value(default: float | int | None, derived: float, sample_count: int) -> float:
-    if default is None or not isinstance(default, (int, float)):
-        return derived
-    weight = min(1.0, sample_count / FULL_WEIGHT_SAMPLES)
-    return default * (1.0 - weight) + derived * weight
-
-
-def _print_sample_summary(samples: List[SampledFeature]) -> None:
-    if not samples:
-        return
-    click.echo("\nFeature annotation summary:")
-    counts = _count_samples(samples)
-    for feature_type, count in counts.items():
-        areas = [s.area for s in samples if s.object_type == feature_type]
-        if not areas:
-            continue
-        click.echo(
-            f"  {feature_type}: {count} sample(s), area median {np.median(areas):.1f}px, min {min(areas):.1f}px, max {max(areas):.1f}px"
-        )
-
-
-def _collect_annotation_points(annotations: List[AnnotationRegion]) -> List[Tuple[float, float]]:
-    points: List[Tuple[float, float]] = []
-    for region in annotations:
-        if region.shape == "circle" and region.circle_center and region.circle_radius:
-            cx, cy = region.circle_center
-            r = region.circle_radius
-            points.extend(
-                [
-                    (cx, cy),
-                    (cx + r, cy),
-                    (cx - r, cy),
-                    (cx, cy + r),
-                    (cx, cy - r),
-                ]
-            )
-        else:
-            points.extend(region.points)
-    return points
-
-
-def _suggest_roi_from_annotations(
-    annotations: List[AnnotationRegion],
-    width: int,
-    height: int,
-) -> Dict[str, object] | None:
-    points = _collect_annotation_points(annotations)
-    if not points:
-        return None
-    xs = [p[0] for p in points]
-    ys = [p[1] for p in points]
-    min_x, max_x = max(0.0, min(xs)), min(float(width), max(xs))
-    min_y, max_y = max(0.0, min(ys)), min(float(height), max(ys))
-    center_x = (min_x + max_x) / 2.0
-    center_y = (min_y + max_y) / 2.0
-    span_x = max_x - min_x
-    span_y = max_y - min_y
-    radius = 0.6 * max(span_x, span_y)
-    radius = max(radius, 10.0)
-    return {
-        "mode": "circle",
-        "center": (center_x, center_y),
-        "radius": radius,
-        "bbox": (min_x, min_y, max_x - min_x, max_y - min_y),
-    }
-
-
-def _suggest_parameters(
-    samples: List[SampledFeature],
+def _apply_samples_to_parameters(
     params: TrackingParameters,
+    samples: Dict[str, List[FeatureSample]],
 ) -> TrackingParameters:
-    if not samples:
-        return params
+    params.threshold = max(1, int(params.threshold - THRESHOLD_BUFFER))
+    params.use_auto_threshold = False
 
-    grouped: Dict[str, List[SampledFeature]] = {}
-    for sample in samples:
-        grouped.setdefault(sample.object_type, []).append(sample)
+    def _apply_feature(feature: str) -> None:
+        feature_samples = samples.get(feature, [])
+        if not feature_samples:
+            return
+        areas = [sample.area for sample in feature_samples]
+        aspect_ratios = [
+            sample.aspect_ratio
+            for sample in feature_samples
+            if math.isfinite(sample.aspect_ratio)
+        ]
+        eccentricities = [sample.eccentricity for sample in feature_samples]
+        solidities = [sample.solidity for sample in feature_samples]
 
-    for obj_type, feats in grouped.items():
-        config = params.get_object_config(obj_type)
-        if config is None or not feats:
-            continue
-        original_config = config.copy()
-        sample_count = len(feats)
-        areas = np.array([f.area for f in feats], dtype=np.float32)
-        aspects = np.array([f.aspect_ratio for f in feats], dtype=np.float32)
-        eccs = np.array([f.eccentricity for f in feats], dtype=np.float32)
-        solids = np.array([f.solidity for f in feats], dtype=np.float32)
+        config = params.object_types.setdefault(feature, {})
+        config["min_area"] = max(1, int(math.floor(min(areas) * (1 - AREA_MARGIN))))
+        config["max_area"] = int(math.ceil(max(areas) * (1 + AREA_MARGIN)))
+        if aspect_ratios:
+            config["aspect_ratio_min"] = round(min(aspect_ratios) * (1 - ASPECT_MARGIN), 2)
+            config["aspect_ratio_max"] = round(max(aspect_ratios) * (1 + ASPECT_MARGIN), 2)
+        if eccentricities:
+            config["eccentricity_min"] = round(max(0.0, min(eccentricities) - ECCENTRICITY_MARGIN), 2)
+            config["eccentricity_max"] = round(min(0.999, max(eccentricities) + ECCENTRICITY_MARGIN), 2)
+        if solidities:
+            config["solidity_min"] = round(max(0.0, min(solidities) - SOLIDITY_MARGIN), 2)
 
-        def bounds(values: np.ndarray, min_width: float, pad: float = 0.25) -> Tuple[float, float]:
-            if values.size == 0:
-                return 0.0, 0.0
-            median = float(np.median(values))
-            mad = float(np.median(np.abs(values - median)))
-            spread = max(mad * 1.4826, min_width)
-            return median - max(spread, median * pad), median + max(spread, median * pad)
+    for feature in FEATURE_TYPES:
+        _apply_feature(feature)
 
-        area_min, area_max = bounds(areas, min_width=10.0)
-        aspect_min, aspect_max = bounds(aspects, min_width=0.1)
-        ecc_min, ecc_max = bounds(eccs, min_width=0.05)
-        sol_min, sol_max = bounds(solids, min_width=0.05)
+    mouth_samples = samples.get("mouth", [])
+    mouth_center = (
+        np.mean([sample.centroid for sample in mouth_samples], axis=0)
+        if mouth_samples
+        else None
+    )
+    if mouth_center is None and params.mouth_pinned and params.pinned_mouth_point is not None:
+        mouth_center = np.array(params.pinned_mouth_point, dtype=float)
 
-        derived_values = {
-            "min_area": max(5, int(area_min)),
-            "max_area": max(int(area_max), int(area_min) + 5),
-            "aspect_ratio_min": max(0.5, aspect_min),
-            "aspect_ratio_max": max(aspect_max, aspect_min + 0.1),
-            "eccentricity_min": max(0.0, ecc_min),
-            "eccentricity_max": min(1.0, max(ecc_max, ecc_min + 0.05)),
-            "solidity_min": max(0.0, sol_min),
-            "solidity_max": min(1.0, max(sol_max, sol_min + 0.05)),
-        }
+    def _set_search_radius(feature: str) -> None:
+        if mouth_center is None:
+            return
+        feature_samples = samples.get(feature, [])
+        if not feature_samples:
+            return
+        dists = [math.dist(sample.centroid, mouth_center) for sample in feature_samples]
+        radius = int(math.ceil(max(dists) * SEARCH_RADIUS_MARGIN))
+        if radius > 0:
+            params.object_types.setdefault(feature, {})["search_radius"] = radius
 
-        if obj_type == "gonad":
-            derived_values["aspect_ratio_min"] = max(1.2, derived_values["aspect_ratio_min"])
-        elif obj_type == "tentacle_bulb":
-            derived_values["aspect_ratio_max"] = min(1.8, derived_values["aspect_ratio_max"])
+    _set_search_radius("gonad")
+    _set_search_radius("tentacle_bulb")
 
-        for key, value in derived_values.items():
-            blended = _blend_value(original_config.get(key), value, sample_count)
-            if key in ("min_area", "max_area"):
-                config[key] = int(blended)
-            else:
-                config[key] = float(blended)
-
+    params.update_object_counts()
     return params
-
-
-def _apply_search_radius_from_samples(
-    samples: List[SampledFeature],
-    params: TrackingParameters,
-) -> None:
-    mouth_centroids = np.array([f.centroid for f in samples if f.object_type == "mouth"], dtype=np.float32)
-    if mouth_centroids.size == 0:
-        return
-    mouth_center = np.mean(mouth_centroids, axis=0)
-
-    for obj_type in ("gonad", "tentacle_bulb"):
-        feats = [f for f in samples if f.object_type == obj_type]
-        if not feats:
-            continue
-        distances = [float(np.linalg.norm(np.array(f.centroid) - mouth_center)) for f in feats]
-        if not distances:
-            continue
-        radius = max(distances) * 1.3
-        config = params.get_object_config(obj_type)
-        if config is not None:
-            config["search_radius"] = radius
 
 
 def run_interactive_feature_sampling(
     video_path: str,
     params: TrackingParameters | None = None,
-    pixel_size_mm: float = 0.01,
-    apply_roi_mask: bool = True,
+    max_frames: int | None = None,
 ) -> TrackingParameters:
-    params = params or TrackingParameters()
-    app = FeatureAnnotationApp(video_path, params, pixel_size_mm)
-    annotations = app.run()
-    if not annotations:
-        return params
+    """Launch the feature sampling UI and return updated tracking parameters."""
 
-    samples = _annotations_to_samples(annotations, (app.height, app.width), pixel_size_mm)
-    _validate_samples(samples, params)
-    params = _suggest_parameters(samples, params)
-    _apply_search_radius_from_samples(samples, params)
-    _print_sample_summary(samples)
+    if params is None:
+        params = TrackingParameters()
 
-    roi_suggestion = _suggest_roi_from_annotations(annotations, app.width, app.height)
-    if roi_suggestion:
-        center = roi_suggestion.get("center")
-        radius = roi_suggestion.get("radius")
-        bbox = roi_suggestion.get("bbox")
-        click.echo(
-            "\nSuggested ROI from annotations:"
-        )
-        if center and isinstance(center, (tuple, list)) and radius:
-            cx, cy = center
+    click.echo("\n=== Feature Sampling UI ===")
+    click.echo("Left pane: raw | middle: background | right: diff (red = above threshold)")
+    if getattr(params, "mouth_pinned", False):
+        click.echo("Pinned mouth mode: mouth annotations are disabled; focus on gonads/bulbs.")
+    click.echo("Use feature hotkeys, n/p to change frame, and the slider or b/B to adjust threshold")
+
+    ui = FeatureSamplingUI(video_path, params, max_frames=max_frames)
+    samples = ui.run()
+
+    updated_params = _apply_samples_to_parameters(params, samples)
+    click.echo("Feature sampling complete. Updated parameters:")
+    click.echo(f"  Threshold: {updated_params.threshold}")
+    for feature in FEATURE_TYPES:
+        config = updated_params.object_types.get(feature, {})
+        if config:
             click.echo(
-                f"  Circle center=({cx:.1f}, {cy:.1f}), radius={radius:.1f}px"
+                f"  {feature}: min_area={config.get('min_area')} max_area={config.get('max_area')} (samples={len(samples.get(feature, []))})"
             )
-        if bbox and isinstance(bbox, (tuple, list)) and len(bbox) == 4:
-            bx, by, bw, bh = bbox
-            click.echo(
-                f"  Bounding box x={bx:.1f}, y={by:.1f}, w={bw:.1f}, h={bh:.1f}"
-            )
-        if click.confirm("Apply this ROI to tracking parameters?", default=True):
-            params.apply_roi_config(roi_suggestion)
-        else:
-            click.echo("Keeping existing ROI configuration.")
 
-    params.update_object_counts()
-    return params
+    return updated_params

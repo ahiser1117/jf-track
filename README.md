@@ -60,10 +60,11 @@ Running the entrypoint launches a small Tkinter GUI that walks through the entir
 
 1. Choose the video file.
 2. Answer whether the video is rotating (enables adaptive background automatically).
-3. Decide if you want to draw a custom ROI (circle, polygon, or bounding box). Skipping this step keeps the defaults (centered circle for rotating videos, entire frame for non-rotating videos).
-4. Decide if you want to run interactive feature sampling for automatic parameter tuning.
-5. Specify how many mouths, gonads, and tentacle bulbs are visible (bulbs can be left blank for auto-detect).
-6. Select how the background threshold should be determined. By default the app computes a per-video Otsu threshold (recommended), but you can enter a manual value if needed.
+3. Indicate if the mouth is **pinned/occluded**. When pinned, you’ll click once on the median projection to set a fixed reference point instead of tracking the mouth.
+4. Decide if you want to draw a custom ROI (circle, polygon, or bounding box). Skipping this step keeps the defaults (centered circle for rotating videos, entire frame for non-rotating videos).
+5. Decide if you want to run interactive feature sampling for automatic parameter tuning (this workflow now sets the background threshold directly).
+6. Specify how many mouths, gonads, and tentacle bulbs are visible (bulbs can be left blank for auto-detect). When the mouth is pinned the count is forced to zero automatically.
+7. Enter an optional frame limit (leave blank to process the full clip).
 
 After the prompts, the tracker runs with the selected parameters, saves results to `tracking_results/multi_object_tracking.zarr`, and renders two visualizations automatically:
 
@@ -79,7 +80,7 @@ python debug_background.py --video path/to/video.mp4 --frame 250 --show
 python debug_background.py --video path/to/video.mp4 --frame 250 --auto-threshold --thresholds 5 10 20 --save-prefix bg_debug
 ```
 
-This makes it easy to confirm that the histogram-based threshold highlights the jellyfish before running the full pipeline.
+If you skip feature sampling, the tracker falls back to the automatic per-video threshold from the background processor. `debug_background.py` remains a handy way to preview that threshold before you run the full pipeline.
 
 ### Programmatic use
 

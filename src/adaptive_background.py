@@ -9,6 +9,8 @@ median of aligned frames.
 
 import cv2
 import numpy as np
+import os
+import tempfile
 from enum import Enum
 from dataclasses import dataclass, field
 from collections import deque
@@ -955,31 +957,68 @@ class BackgroundProcessor:
         if not cap.isOpened():
             raise ValueError(f"Unable to open video: {video_path}")
 
-        frames: list[np.ndarray] = []
-        frame_idx = 0
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total_frames <= 0:
+            total_frames = None
 
-        while True:
-            if max_frames is not None and frame_idx >= max_frames:
-                break
-            ret, frame = cap.read()
-            if not ret:
-                break
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            if roi_mask is not None:
-                gray = cv2.bitwise_and(gray, roi_mask)
-            frames.append(gray.astype(np.float32))
-            frame_idx += 1
+        if max_frames is not None and max_frames > 0:
+            frame_limit = max_frames
+        else:
+            frame_limit = total_frames
 
-        cap.release()
+        if frame_limit is None:
+            frame_limit = BackgroundProcessor._count_total_frames(video_path)
 
-        if not frames:
+        if frame_limit <= 0:
+            cap.release()
             raise ValueError("Video contains no readable frames")
 
-        stack = np.stack(frames, axis=0)
-        background = np.median(stack, axis=0).astype(np.uint8)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if width <= 0 or height <= 0:
+            cap.release()
+            raise ValueError("Unable to determine video dimensions")
 
-        diff_values = np.abs(stack - background.astype(np.float32))
-        valid = diff_values[diff_values > 2.0]
+        tmp_file = tempfile.NamedTemporaryFile(delete=False)
+        tmp_path = tmp_file.name
+        tmp_file.close()
+        frames_memmap: np.memmap | None = None
+
+        try:
+            frames_memmap = np.memmap(
+                tmp_path,
+                dtype=np.float32,
+                mode="w+",
+                shape=(frame_limit, height, width),
+            )
+
+            frame_idx = 0
+            while frame_idx < frame_limit:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                if roi_mask is not None:
+                    gray = cv2.bitwise_and(gray, roi_mask)
+                frames_memmap[frame_idx] = gray.astype(np.float32)
+                frame_idx += 1
+
+            if frame_idx == 0:
+                raise ValueError("Video contains no readable frames")
+
+            frames_view = frames_memmap[:frame_idx]
+            background = np.median(frames_view, axis=0).astype(np.uint8)
+
+            diff_values = np.abs(frames_view - background.astype(np.float32))
+            valid = diff_values[diff_values > 2.0]
+            frames_view = None
+        finally:
+            cap.release()
+            if frames_memmap is not None:
+                del frames_memmap
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
         auto_threshold: float | None
         if valid.size:
             try:
@@ -990,6 +1029,24 @@ class BackgroundProcessor:
             auto_threshold = None
 
         return background, auto_threshold
+
+    @staticmethod
+    def _count_total_frames(video_path: str) -> int:
+        """Count total readable frames in a video."""
+
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise ValueError(f"Unable to open video: {video_path}")
+
+        count = 0
+        while True:
+            ret, _ = cap.read()
+            if not ret:
+                break
+            count += 1
+
+        cap.release()
+        return count
 
 
     def process_frame(

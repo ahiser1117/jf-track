@@ -40,6 +40,8 @@ class TrackingParameters:
     num_mouths: int = 1
     num_gonads: int = 0  # 0-4 gonads per animal
     num_tentacle_bulbs: int | None = None  # None = auto-detect unlimited
+    mouth_pinned: bool = False
+    pinned_mouth_point: tuple[float, float] | None = None
 
     # ROI configuration (interactive selection / bounding box)
     roi_mode: str = "auto"  # "auto", "circle", "polygon", "bounding_box"
@@ -121,6 +123,9 @@ class TrackingParameters:
         if "rotation_center" in d and d["rotation_center"] is not None:
             d = d.copy()
             d["rotation_center"] = tuple(d["rotation_center"])
+        if "pinned_mouth_point" in d and d["pinned_mouth_point"] is not None:
+            d = d.copy()
+            d["pinned_mouth_point"] = tuple(d["pinned_mouth_point"])
         return cls(**d)
 
     def to_json(self) -> str:

@@ -282,3 +282,74 @@ def run_circle_roi_selection(video_path: str, max_frames: int | None = None) -> 
         "center": (cx_orig, cy_orig),
         "radius": radius_orig,
     }
+
+
+def _select_point_from_frame(frame: np.ndarray, window_title: str) -> tuple[int, int]:
+    if frame.ndim == 2:
+        display = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+    else:
+        display = frame.copy()
+
+    selected_point: tuple[int, int] | None = None
+    confirmed = False
+    cancelled = False
+
+    def mouse_callback(event, x, y, flags, param):
+        nonlocal selected_point
+        if event == cv2.EVENT_LBUTTONDOWN:
+            selected_point = (x, y)
+
+    cv2.namedWindow(window_title, cv2.WINDOW_NORMAL)
+    cv2.setMouseCallback(window_title, mouse_callback)
+
+    try:
+        while True:
+            overlay = display.copy()
+            instructions = [
+                "Pinned mouth selection:",
+                "Click to place the reference point",
+                "Press Enter to confirm, 'r' to reset, ESC to cancel",
+            ]
+            _draw_instructions(overlay, instructions)
+            if selected_point is not None:
+                cv2.drawMarker(
+                    overlay,
+                    selected_point,
+                    (0, 255, 0),
+                    markerType=cv2.MARKER_CROSS,
+                    markerSize=12,
+                    thickness=2,
+                )
+            cv2.imshow(window_title, overlay)
+            key = cv2.waitKey(20) & 0xFF
+            if key == 27:  # ESC
+                cancelled = True
+                break
+            if key in (ord("r"), ord("R")):
+                selected_point = None
+            if key in (13, 10, ord("\r"), ord("\n")) and selected_point is not None:
+                confirmed = True
+                break
+
+        if cancelled or not confirmed or selected_point is None:
+            raise ValueError("Pinned mouth selection cancelled")
+        return selected_point
+    finally:
+        cv2.destroyWindow(window_title)
+
+
+def run_reference_point_selection(
+    video_path: str,
+    max_frames: int | None = None,
+    window_title: str = "Select pinned mouth reference",
+) -> tuple[float, float]:
+    """Prompt the user to click a single reference point on the median projection."""
+
+    median_frame, scale_x, scale_y = compute_median_intensity_projection(
+        video_path, max_frames=max_frames
+    )
+    px, py = _select_point_from_frame(median_frame, window_title)
+
+    point_x = float(px * scale_x)
+    point_y = float(py * scale_y)
+    return point_x, point_y

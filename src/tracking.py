@@ -874,7 +874,9 @@ def run_multi_object_tracking(
     )
     if not params.adaptive_background and params.use_auto_threshold:
         params.threshold = bg_processor.threshold
-        print(f"Using auto threshold {params.threshold} for non-rotating background subtraction")
+        print(
+            f"Using auto threshold {params.threshold} for non-rotating background subtraction"
+        )
     
     # Initialize trackers for each enabled object type
     trackers = {}
@@ -890,6 +892,7 @@ def run_multi_object_tracking(
     # Tracking variables
     frame_idx = 0
     last_reference_position = None  # Used for spatial constraints
+    pinned_reference = params.pinned_mouth_point if params.mouth_pinned else None
     prev_state = bg_processor.get_state()
     
     print("Processing frames...")
@@ -933,6 +936,9 @@ def run_multi_object_tracking(
 
         # Process each object type in order (mouth first as reference)
         reference_position = None
+        if pinned_reference is not None:
+            reference_position = pinned_reference
+            last_reference_position = reference_position
 
         for obj_type in enabled_types:
             config = params.get_object_config(obj_type)

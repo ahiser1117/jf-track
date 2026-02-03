@@ -1,7 +1,13 @@
+import math
 import numpy as np
 
 from src.tracker import TrackingParameters
 from src.tracking import get_roi_mask_for_video
+from src.interactive_sampling import (
+    FeatureSample,
+    _apply_samples_to_parameters,
+    SEARCH_RADIUS_MARGIN,
+)
 
 
 def test_non_rotating_defaults_to_full_frame_mask():
@@ -34,3 +40,31 @@ def test_custom_bounding_box_roi_is_respected():
     # Inside bbox should be white, outside black
     assert mask[2, 3] == 255
     assert mask[0, 0] == 0
+
+
+def test_pinned_mouth_applies_search_radius_without_mouth_samples():
+    params = TrackingParameters()
+    params.mouth_pinned = True
+    params.pinned_mouth_point = (100.0, 100.0)
+
+    gonad_sample = FeatureSample(
+        feature_type="gonad",
+        frame_idx=0,
+        centroid=(130.0, 100.0),
+        area=50.0,
+        bbox=(0, 0, 10, 10),
+        aspect_ratio=2.0,
+        eccentricity=0.8,
+        solidity=0.9,
+    )
+
+    samples = {
+        "mouth": [],
+        "gonad": [gonad_sample],
+        "tentacle_bulb": [],
+    }
+
+    _apply_samples_to_parameters(params, samples)
+
+    expected_radius = int(math.ceil(30.0 * SEARCH_RADIUS_MARGIN))
+    assert params.object_types["gonad"]["search_radius"] == expected_radius

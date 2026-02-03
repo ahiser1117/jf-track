@@ -31,10 +31,10 @@ Launching the app opens a Tkinter wizard that asks:
 
 1. **Video selection** – choose the clip to analyze.
 2. **Rotation** – answer “Is this video rotating?” (turns adaptive background on/off).
-3. **Custom ROI** – optionally launch the ROI selector (circle, polygon, or bounding box) for both rotating and non-rotating clips. Skipping this step keeps the defaults (centered circle for rotating videos, full-frame mask for non-rotating videos).
-4. **Parameter optimization** – decide whether to run interactive feature sampling.
-5. **Object counts** – specify mouths, gonads, and tentacle bulbs (leave bulbs blank for auto-detect).
-6. **Threshold selection** – choose automatic per-video thresholding (recommended) or enter a manual value if you already know what works for the clip.
+3. **Pinned mouth** – indicate whether the mouth is pinned/occluded. When pinned you’ll click a single reference point on the median projection, and the tracker will skip mouth detection while still giving the gonads/bulbs a fixed reference.
+4. **Custom ROI** – optionally launch the ROI selector (circle, polygon, or bounding box) for both rotating and non-rotating clips. Skipping this step keeps the defaults (centered circle for rotating videos, full-frame mask for non-rotating videos).
+5. **Parameter optimization** – decide whether to run interactive feature sampling (the slider chosen there now sets the tracking threshold directly).
+6. **Object counts** – specify mouths, gonads, and tentacle bulbs (leave bulbs blank for auto-detect). When the mouth is pinned the wizard automatically disables mouth tracking.
 7. **Frame limit** – enter how many frames to process (leave blank to run the entire video). This lets you test the pipeline on the first few hundred frames before committing to a full run.
 
 After tracking completes, two videos are written automatically under `tracking_results/`:
@@ -50,7 +50,7 @@ The `.zarr` store (`multi_object_tracking.zarr`) contains the multi-object track
 
 - **Rotating videos** – choose “Yes” when prompted. The adaptive background state machine (STATIC/ROTATING/TRANSITION) activates automatically, the search centers are rotated during motion, and the default ROI is a centered circle unless you draw a custom region.
 
-- **Non-rotating videos** – choose “No.” A full-video median background is computed once and reused. Auto thresholding is recommended, but you can enter a manual value or draw a custom ROI to trim the frame before background subtraction.
+- **Non-rotating videos** – choose “No.” A full-video median background is computed once and reused. If you skip feature sampling, the tracker falls back to the automatic per-video threshold; otherwise the sampler’s slider defines the threshold explicitly.
 
 - **Visualizations** – both the standard and composite MP4s are produced automatically. The composite view reuses the same background/diff data as the rotating pipeline, making it easy to debug illumination changes.
 
@@ -106,7 +106,7 @@ python test_multi_object_tracking.py test roi video.mp4
 ## 🎮 Interactive Controls
 
 ### Feature Sampling
-- `m`: Switch to mouth sampling mode
+- `m`: Switch to mouth sampling mode (disabled when the mouth is pinned)
 - `g`: Switch to gonad sampling mode  
 - `t`: Switch to tentacle bulb sampling mode
 - `u`: Undo last sample

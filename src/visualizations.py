@@ -745,6 +745,11 @@ def save_multi_object_labeled_video(
 
     video_type = getattr(params, "video_type", "non_rotating") or "non_rotating"
     roi_mask = get_roi_mask_for_video(params, height, width, video_type)
+    pinned_point = None
+    if getattr(params, "mouth_pinned", False):
+        pinned = getattr(params, "pinned_mouth_point", None)
+        if pinned:
+            pinned_point = (float(pinned[0]), float(pinned[1]))
 
     # Setup background processor
     bg_processor = BackgroundProcessor(
@@ -799,31 +804,19 @@ def save_multi_object_labeled_video(
             cv2.normalize(diff, diff_display_gray, 0, 255, cv2.NORM_MINMAX)
         bg_display = cv2.cvtColor(background_gray, cv2.COLOR_GRAY2BGR)
         diff_display = cv2.cvtColor(diff_display_gray, cv2.COLOR_GRAY2BGR)
-        
-        threshold_overlay = None
         if show_threshold_overlay and mask is not None:
-            threshold_overlay = np.zeros_like(frame)
-            threshold_overlay[mask > 0] = (0, 0, 255)
-
-        threshold_overlay = None
-        if show_threshold_overlay and mask is not None:
-            threshold_overlay = np.zeros_like(frame)
-            threshold_overlay[mask > 0] = (0, 0, 255)
+            mask_overlay = np.zeros_like(diff_display)
+            mask_overlay[mask > 0] = (0, 0, 255)
+            diff_display = cv2.addWeighted(diff_display, 0.4, mask_overlay, 0.6, 0)
 
         if background_mode == "original":
             display_frame = frame.copy()
         elif background_mode == "diff":
-            display_frame = cv2.cvtColor(diff, cv2.COLOR_GRAY2BGR)
+            display_frame = diff_display.copy()
         elif background_mode == "mask":
             display_frame = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
         else:
             display_frame = frame.copy()
-
-        if threshold_overlay is not None:
-            display_frame = cv2.addWeighted(display_frame, 0.7, threshold_overlay, 0.3, 0)
-
-        if threshold_overlay is not None:
-            display_frame = cv2.addWeighted(display_frame, 0.7, threshold_overlay, 0.3, 0)
         
         # Draw each object type
         for obj_type, tracking_data in tracking_results.items():
@@ -902,29 +895,41 @@ def save_multi_object_labeled_video(
                 cv2.circle(display_frame, center, radius, (128, 128, 128), 2)
             else:
                 cv2.rectangle(display_frame, (0, 0), (width - 1, height - 1), (128, 128, 128), 1)
-        
+
+        if params.mouth_pinned and pinned_point is not None:
+            pin_int = (int(round(pinned_point[0])), int(round(pinned_point[1])))
+            cv2.drawMarker(
+                display_frame,
+                pin_int,
+                (0, 165, 255),
+                markerType=cv2.MARKER_TILTED_CROSS,
+                markerSize=12,
+                thickness=2,
+            )
+
         # Draw search radii if enabled
         if show_search_radii:
             # Find mouth position for reference
+            mouth_pos = None
             if "mouth" in tracking_results:
                 mouth_x = tracking_results["mouth"].x
                 mouth_y = tracking_results["mouth"].y
                 mouth_track_ids = tracking_results["mouth"].track_ids
-                
+
                 if len(mouth_track_ids) > 0 and frame_idx < mouth_x.shape[1]:
-                    mouth_pos_x = mouth_x[0, frame_idx]  # Use first mouth track
+                    mouth_pos_x = mouth_x[0, frame_idx]
                     mouth_pos_y = mouth_y[0, frame_idx]
-                    
+
                     if not np.isnan(mouth_pos_x):
                         mouth_pos = (int(mouth_pos_x), int(mouth_pos_y))
-                        
-                        # Draw mouth search radius (orange)
-                        if params.mouth_search_radius:
-                            cv2.circle(display_frame, mouth_pos, params.mouth_search_radius, (0, 165, 255), 1)
-                        
-                        # Draw bulb search radius (cyan)
-                        if params.bulb_search_radius:
-                            cv2.circle(display_frame, mouth_pos, params.bulb_search_radius, (255, 200, 0), 1)
+            elif pinned_point is not None:
+                mouth_pos = (int(round(pinned_point[0])), int(round(pinned_point[1])))
+
+            if mouth_pos is not None:
+                if params.mouth_search_radius:
+                    cv2.circle(display_frame, mouth_pos, params.mouth_search_radius, (0, 165, 255), 1)
+                if params.bulb_search_radius:
+                    cv2.circle(display_frame, mouth_pos, params.bulb_search_radius, (255, 200, 0), 1)
         
         # Draw info panel
         info_text = f"Frame: {frame_idx + 1}/{total_frames}"
@@ -942,14 +947,6 @@ def save_multi_object_labeled_video(
                 bg_display,
                 diff_display,
             ])
-            if threshold_overlay is not None:
-                composite_frame[:, :width] = cv2.addWeighted(
-                    composite_frame[:, :width], 0.7, threshold_overlay, 0.3, 0
-                )
-            if threshold_overlay is not None:
-                composite_frame[:, :width] = cv2.addWeighted(
-                    composite_frame[:, :width], 0.7, threshold_overlay, 0.3, 0
-                )
             pane_titles = ["Labeled", "Background", "Diff"]
             for idx, title in enumerate(pane_titles):
                 origin_x = idx * width + 15

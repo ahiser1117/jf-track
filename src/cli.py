@@ -4,7 +4,11 @@ from pathlib import Path
 
 import click
 
-from src.bounding_box_selector import run_bounding_box_selection, run_circle_roi_selection
+from src.bounding_box_selector import (
+    run_bounding_box_selection,
+    run_circle_roi_selection,
+    run_reference_point_selection,
+)
 from src.roi_selector import run_interactive_roi_selection
 from src.gui_prompts import prompt_for_tracking_configuration, PromptResult
 from src.interactive_sampling import run_interactive_feature_sampling
@@ -50,7 +54,7 @@ def _merge_parameter_configs(
 
 def _initialize_parameters(prompt: PromptResult) -> TrackingParameters:
     params = TrackingParameters()
-    params.num_mouths = max(1, prompt.num_mouths)
+    params.num_mouths = max(0, prompt.num_mouths)
     params.num_gonads = max(0, prompt.num_gonads)
     params.num_tentacle_bulbs = prompt.num_tentacle_bulbs
     params.update_object_counts()
@@ -58,14 +62,17 @@ def _initialize_parameters(prompt: PromptResult) -> TrackingParameters:
     params.video_type = "rotating" if prompt.is_rotating else "non_rotating"
     params.adaptive_background = prompt.is_rotating
 
+    params.mouth_pinned = prompt.mouth_pinned
+    if params.mouth_pinned:
+        params.num_mouths = 0
+        params.update_object_counts()
+
     params.roi_mode = "auto"
     params.roi_center = None
     params.roi_radius = None
     params.roi_points = []
     params.roi_bbox = None
-    params.use_auto_threshold = prompt.use_auto_threshold
-    if not prompt.use_auto_threshold and prompt.manual_threshold is not None:
-        params.threshold = max(1, prompt.manual_threshold)
+    params.use_auto_threshold = not prompt.use_feature_sampling
 
     return params
 
@@ -115,19 +122,6 @@ def _apply_polygon_roi(
 def _prepare_tracking_parameters(prompt: PromptResult) -> TrackingParameters:
     params = _initialize_parameters(prompt)
 
-    if prompt.use_feature_sampling:
-        click.echo("Launching interactive feature sampling for parameter tuning...")
-        try:
-            tuned_params = run_interactive_feature_sampling(
-                prompt.video_path,
-                params,
-                apply_roi_mask=False,
-            )
-        except Exception as exc:  # pragma: no cover - interactive UI failure
-            click.echo(f"Feature sampling failed: {exc}")
-        else:
-            _merge_parameter_configs(params, tuned_params)
-
     if prompt.use_custom_roi:
         try:
             shape = (prompt.roi_shape or "circle").lower()
@@ -141,6 +135,38 @@ def _prepare_tracking_parameters(prompt: PromptResult) -> TrackingParameters:
             raise click.ClickException(f"ROI selection failed: {exc}") from exc
     else:
         params.clear_roi()
+
+    if prompt.mouth_pinned:
+        click.echo("Select the pinned mouth reference point on the median projection...")
+        try:
+            reference_point = run_reference_point_selection(
+                prompt.video_path,
+                max_frames=prompt.max_frames,
+            )
+        except Exception as exc:  # pragma: no cover - user interaction path
+            raise click.ClickException(f"Pinned mouth selection failed: {exc}") from exc
+        params.mouth_pinned = True
+        params.pinned_mouth_point = reference_point
+        params.num_mouths = 0
+        params.update_object_counts()
+    else:
+        params.mouth_pinned = False
+        params.pinned_mouth_point = None
+
+    if prompt.use_feature_sampling:
+        click.echo("Launching interactive feature sampling for parameter tuning...")
+        try:
+            tuned_params = run_interactive_feature_sampling(
+                prompt.video_path,
+                params,
+                max_frames=prompt.max_frames,
+            )
+        except Exception as exc:  # pragma: no cover - interactive UI failure
+            click.echo(f"Feature sampling failed: {exc}")
+        else:
+            _merge_parameter_configs(params, tuned_params)
+            params.threshold = tuned_params.threshold
+            params.use_auto_threshold = False
 
     params.update_object_counts()
     return params

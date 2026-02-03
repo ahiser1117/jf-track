@@ -27,6 +27,10 @@ When `adaptive_background=True`, the system handles videos where the background 
 - Users can define circular, polygonal, or bounding-box ROIs via the GUI prompts or the feature-sampling workflow. These ROI settings are saved inside `TrackingParameters` and reused when visualizing results.
 - Rotating videos default to a centered circle; non-rotating videos default to a full-frame mask unless the user specifies otherwise.
 
+### Pinned Mouth Mode
+- Some recordings pin or occlude the mouth, making it impossible to track directly. The prompt workflow now asks whether the mouth is pinned. When enabled, the user clicks a single reference point on the median projection instead of tracking the mouth feature.
+- `TrackingParameters.mouth_pinned=True` disables mouth detection, stores the fixed `pinned_mouth_point`, and uses that reference for all gonad/bulb search radii in both tracking and visualization.
+
 ### Track Merging
 The mouth may be temporarily lost (occlusion) and reacquired. `merge_mouth_tracks()` links non-overlapping track segments into one continuous track. For overlapping frames, the detection with larger area is used.
 
@@ -111,3 +115,4 @@ After modifying tracking logic:
 3. For non-rotating footage, confirm the full-video median background looks reasonable (no residual jellyfish).
 4. Use `background_mode="diff"` or `"mask"` in labeled video to see exactly what the tracker processed.
 5. Verify the expected ROI outline appears in visualizations (circle/polygon/bounding box), especially when loading saved `.zarr` results.
+6. For pinned-mouth runs, confirm the fixed reference marker appears in the labeled/composite videos and that gonad/bulb detections stay within the configured search radii.

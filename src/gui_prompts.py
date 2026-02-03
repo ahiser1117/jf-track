@@ -12,14 +12,13 @@ class PromptResult:
     video_path: str
     is_rotating: bool
     use_feature_sampling: bool
+    mouth_pinned: bool
     num_mouths: int
     num_gonads: int
     num_tentacle_bulbs: int | None
     use_custom_roi: bool
     roi_shape: str
     max_frames: int | None
-    use_auto_threshold: bool
-    manual_threshold: int | None
 
 
 class TrackingPromptGUI:
@@ -130,12 +129,21 @@ class TrackingPromptGUI:
                 default=False,
             )
 
-            num_mouths = self._ask_count(
-                "Mouth Count",
-                "How many mouths should be tracked?",
-                default=1,
-                min_value=1,
+            mouth_pinned = self._ask_yes_no(
+                "Pinned Mouth",
+                "Is the mouth pinned or occluded (stationary reference point)?",
+                default=False,
             )
+
+            if mouth_pinned:
+                num_mouths = 0
+            else:
+                num_mouths = self._ask_count(
+                    "Mouth Count",
+                    "How many mouths should be tracked?",
+                    default=1,
+                    min_value=1,
+                )
             num_gonads = self._ask_count(
                 "Gonad Count",
                 "How many gonads are visible? (0-4)",
@@ -169,32 +177,18 @@ class TrackingPromptGUI:
                 "How many frames should be processed?\nLeave blank to use the entire video.",
             )
 
-            use_auto_threshold = self._ask_yes_no(
-                "Threshold",
-                "Use automatic per-video threshold?",
-                default=True,
-            )
-            manual_threshold = None
-            if not use_auto_threshold:
-                manual_threshold = self._ask_optional_positive_int(
-                    "Manual Threshold",
-                    "Enter a positive threshold value (pixels).",
-                )
-                if manual_threshold is None:
-                    use_auto_threshold = True
 
             return PromptResult(
                 video_path=video_path,
                 is_rotating=is_rotating,
                 use_feature_sampling=use_sampling,
+                mouth_pinned=mouth_pinned,
                 num_mouths=int(num_mouths or 1),
                 num_gonads=int(num_gonads or 0),
                 num_tentacle_bulbs=None if num_tentacle_bulbs is None else int(num_tentacle_bulbs),
                 use_custom_roi=use_custom_roi,
                 roi_shape=roi_shape,
                 max_frames=max_frames,
-                use_auto_threshold=use_auto_threshold,
-                manual_threshold=manual_threshold,
             )
         finally:
             self._root.destroy()
