@@ -37,12 +37,11 @@ Launching the app opens a Tkinter wizard that asks:
 6. **Object counts** – specify mouths, gonads, and tentacle bulbs (leave bulbs blank for auto-detect). When the mouth is pinned the wizard automatically disables mouth tracking.
 7. **Frame limit** – enter how many frames to process (leave blank to run the entire video). This lets you test the pipeline on the first few hundred frames before committing to a full run.
 
-After tracking completes, two videos are written automatically under `tracking_results/`:
+After tracking completes, a folder named `<video_dir>/<video_name>_results/` is created next to the input clip. It contains:
 
+- `multi_object_tracking.zarr` – the full set of tracks and run parameters.
 - `multi_object_labeled.mp4` – standard overlay.
 - `multi_object_labeled_composite.mp4` – labeled/original, background, and diff frames side by side so you can compare what the tracker saw.
-
-The `.zarr` store (`multi_object_tracking.zarr`) contains the multi-object tracks plus the exact `TrackingParameters` used in the run.
 
 > ❗ **Batch mode**: the legacy `batch_process.py` still targets the old flag-based CLI and is currently considered unsupported until a non-interactive configuration path is reintroduced.
 
@@ -52,7 +51,7 @@ The `.zarr` store (`multi_object_tracking.zarr`) contains the multi-object track
 
 - **Non-rotating videos** – choose “No.” A full-video median background is computed once and reused. If you skip feature sampling, the tracker falls back to the automatic per-video threshold; otherwise the sampler’s slider defines the threshold explicitly.
 
-- **Visualizations** – both the standard and composite MP4s are produced automatically. The composite view reuses the same background/diff data as the rotating pipeline, making it easy to debug illumination changes.
+- **Visualizations** – both the standard and composite MP4s are produced automatically inside the per-video results folder. The composite view reuses the same background/diff data as the rotating pipeline, making it easy to debug illumination changes.
 
 ### Testing
 ```bash
@@ -151,7 +150,7 @@ results.zarr/
 - **Track Trails**: Colored lines showing last 20 frames
 - **ROI Boundary**: Gray circle/polygon outline
 - **Search Radii**: Optional colored circles around reference positions
-- **Automatic Outputs**: Every prompt-driven run now saves two videos under the tracking results directory: `multi_object_labeled.mp4` (standard annotated view) and `multi_object_labeled_composite.mp4`, which shows the labeled frame, the current background, and the diff image side by side using the same adaptive background logic as rotating runs.
+- **Automatic Outputs**: Every prompt-driven run now saves the `.zarr` store and both visualization videos inside `<video_dir>/<video_name>_results/`. The composite MP4 shows the labeled frame, the current background, and the diff image side by side using the same adaptive background logic as rotating runs.
 
 ## 🔄 Backward Compatibility
 

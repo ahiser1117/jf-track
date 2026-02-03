@@ -18,9 +18,6 @@ from src.tracker import TrackingParameters
 from src.tracking import run_multi_object_tracking
 
 
-DEFAULT_OUTPUT_DIR = Path("./tracking_results")
-
-
 def _merge_parameter_configs(
     base: TrackingParameters,
     tuned: TrackingParameters,
@@ -172,8 +169,9 @@ def _prepare_tracking_parameters(prompt: PromptResult) -> TrackingParameters:
     return params
 
 
-def _ensure_output_dir() -> Path:
-    output_dir = DEFAULT_OUTPUT_DIR
+def _resolve_results_dir(video_path: str) -> Path:
+    video_path_path = Path(video_path).expanduser().resolve()
+    output_dir = video_path_path.parent / f"{video_path_path.stem}_results"
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir
 
@@ -199,7 +197,7 @@ def run_prompted_tracking() -> None:
         max_frames=prompt.max_frames,
     )
 
-    output_dir = _ensure_output_dir()
+    output_dir = _resolve_results_dir(prompt.video_path)
     zarr_path = output_dir / "multi_object_tracking.zarr"
     save_multi_object_tracking_to_zarr(tracking_results, str(zarr_path), fps, params)
 

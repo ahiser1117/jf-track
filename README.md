@@ -66,8 +66,9 @@ Running the entrypoint launches a small Tkinter GUI that walks through the entir
 6. Specify how many mouths, gonads, and tentacle bulbs are visible (bulbs can be left blank for auto-detect). When the mouth is pinned the count is forced to zero automatically.
 7. Enter an optional frame limit (leave blank to process the full clip).
 
-After the prompts, the tracker runs with the selected parameters, saves results to `tracking_results/multi_object_tracking.zarr`, and renders two visualizations automatically:
+After the prompts, the tracker runs with the selected parameters, writes everything to a per-video folder named `<video_dir>/<video_name>_results/`, and renders two visualizations automatically:
 
+- `multi_object_tracking.zarr`: multi-object tracking results.
 - `multi_object_labeled.mp4`: standard annotated video.
 - `multi_object_labeled_composite.mp4`: labeled frame + background + diff side by side, using the same adaptive/rolling background logic as the tracker.
 
@@ -108,7 +109,7 @@ save_two_pass_labeled_video("path/to/video.avi", "output.zarr", "labeled.mp4")
 
 ### Background Subtraction
 
-- **Non-rotating videos**: `BackgroundProcessor` loads the clip once, computes a median-intensity projection across every available frame (or `max_frames` if specified), and optionally derives an Otsu threshold from the residuals. This produces a single global background that matches what the tracker and labeled videos use.
+- **Non-rotating videos**: `BackgroundProcessor` samples up to 60 evenly spaced frames (respecting `max_frames` when provided), computes a median-intensity projection from those samples, and optionally derives an Otsu threshold from the residuals. This produces a single global background that matches what the tracker and labeled videos use, without loading the entire video into memory.
 
 - **Rotating videos**: `AdaptiveBackgroundManager` monitors frame-to-frame rotation with ORB + RANSAC, maintains a STATIC/ROTATING/TRANSITION state machine, and only produces masks during STATIC episodes. Buffered frames are rotated to align with the current orientation before computing the median, and search centers are rotated while the sample spins so they reappear in the correct coordinates when the episode stabilizes.
 

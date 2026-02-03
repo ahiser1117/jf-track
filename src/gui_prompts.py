@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import contextmanager
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog
 
@@ -28,21 +29,51 @@ class TrackingPromptGUI:
         self._root = tk.Tk()
         self._root.withdraw()
         self._root.update()
+        self._root.geometry("1x1+0+0")
+
+    @contextmanager
+    def _focused_dialog(self):
+        try:
+            self._root.update_idletasks()
+            self._root.deiconify()
+            self._root.lift()
+            self._root.attributes("-topmost", True)
+            self._root.focus_force()
+            yield
+        finally:
+            self._root.attributes("-topmost", False)
+            self._root.withdraw()
+
+    def _run_dialog(self, func, *args, **kwargs):
+        with self._focused_dialog():
+            return func(*args, **kwargs)
 
     def _ask_yes_no(self, title: str, question: str, default: bool = False) -> bool:
-        result = messagebox.askyesno(title, question, parent=self._root, default="yes" if default else "no")
+        result = self._run_dialog(
+            messagebox.askyesno,
+            title,
+            question,
+            parent=self._root,
+            default="yes" if default else "no",
+        )
         return bool(result)
 
     def _ask_required_path(self) -> str:
         while True:
-            path = filedialog.askopenfilename(
+            path = self._run_dialog(
+                filedialog.askopenfilename,
                 title="Select Jellyfish Video",
                 filetypes=[("Video Files", "*.avi *.mp4 *.mov *.mkv"), ("All Files", "*.*")],
                 parent=self._root,
             )
             if path:
                 return path
-            retry = messagebox.askretrycancel("Video Required", "A video is required to continue.")
+            retry = self._run_dialog(
+                messagebox.askretrycancel,
+                "Video Required",
+                "A video is required to continue.",
+                parent=self._root,
+            )
             if not retry:
                 raise RuntimeError("Video selection cancelled")
 
@@ -57,25 +88,51 @@ class TrackingPromptGUI:
     ) -> int | None:
         initial = "" if default is None else str(default)
         while True:
-            value = simpledialog.askstring(title, prompt_text, initialvalue=initial, parent=self._root)
+            value = self._run_dialog(
+                simpledialog.askstring,
+                title,
+                prompt_text,
+                initialvalue=initial,
+                parent=self._root,
+            )
             if value is None:
                 raise RuntimeError("User cancelled while entering counts")
             stripped = value.strip()
             if stripped == "":
                 if allow_blank:
                     return None
-                messagebox.showerror(title, "A numeric value is required.")
+                self._run_dialog(
+                    messagebox.showerror,
+                    title,
+                    "A numeric value is required.",
+                    parent=self._root,
+                )
                 continue
             try:
                 number = int(stripped)
             except ValueError:
-                messagebox.showerror(title, "Please enter a whole number.")
+                self._run_dialog(
+                    messagebox.showerror,
+                    title,
+                    "Please enter a whole number.",
+                    parent=self._root,
+                )
                 continue
             if number < min_value:
-                messagebox.showerror(title, f"Value must be >= {min_value}.")
+                self._run_dialog(
+                    messagebox.showerror,
+                    title,
+                    f"Value must be >= {min_value}.",
+                    parent=self._root,
+                )
                 continue
             if max_value is not None and number > max_value:
-                messagebox.showerror(title, f"Value must be <= {max_value}.")
+                self._run_dialog(
+                    messagebox.showerror,
+                    title,
+                    f"Value must be <= {max_value}.",
+                    parent=self._root,
+                )
                 continue
             return number
 
@@ -85,7 +142,13 @@ class TrackingPromptGUI:
         prompt_text: str,
     ) -> int | None:
         while True:
-            value = simpledialog.askstring(title, prompt_text, initialvalue="", parent=self._root)
+            value = self._run_dialog(
+                simpledialog.askstring,
+                title,
+                prompt_text,
+                initialvalue="",
+                parent=self._root,
+            )
             if value is None:
                 raise RuntimeError("User cancelled while entering frame limit")
             stripped = value.strip()
@@ -94,10 +157,20 @@ class TrackingPromptGUI:
             try:
                 number = int(stripped)
             except ValueError:
-                messagebox.showerror(title, "Please enter a whole number or leave blank.")
+                self._run_dialog(
+                    messagebox.showerror,
+                    title,
+                    "Please enter a whole number or leave blank.",
+                    parent=self._root,
+                )
                 continue
             if number <= 0:
-                messagebox.showerror(title, "Frame count must be greater than zero.")
+                self._run_dialog(
+                    messagebox.showerror,
+                    title,
+                    "Frame count must be greater than zero.",
+                    parent=self._root,
+                )
                 continue
             return number
 
@@ -106,7 +179,8 @@ class TrackingPromptGUI:
 
         valid = {"circle", "polygon", "bounding_box"}
         while True:
-            value = simpledialog.askstring(
+            value = self._run_dialog(
+                simpledialog.askstring,
                 "ROI Shape",
                 "Enter ROI shape (circle, polygon, bounding_box)",
                 initialvalue="circle",
@@ -117,7 +191,12 @@ class TrackingPromptGUI:
             shape = value.strip().lower()
             if shape in valid:
                 return shape
-            messagebox.showerror("ROI Shape", "Please enter circle, polygon, or bounding_box.")
+            self._run_dialog(
+                messagebox.showerror,
+                "ROI Shape",
+                "Please enter circle, polygon, or bounding_box.",
+                parent=self._root,
+            )
 
     def collect_inputs(self) -> PromptResult:
         try:

@@ -9,8 +9,6 @@ median of aligned frames.
 
 import cv2
 import numpy as np
-import os
-import tempfile
 from enum import Enum
 from dataclasses import dataclass, field
 from collections import deque
@@ -929,8 +927,11 @@ class BackgroundProcessor:
                 initial_center_estimate=rotation_center,
             )
         else:
-            background, auto_threshold = self._compute_full_median_background(
-                video_path, max_frames=max_frames, roi_mask=self._roi_mask
+            background, auto_threshold = self._compute_sampled_background(
+                video_path,
+                max_frames=max_frames,
+                roi_mask=self._roi_mask,
+                num_samples=60,
             )
             self._global_background = background
             if use_auto_threshold and auto_threshold is not None:
@@ -946,78 +947,53 @@ class BackgroundProcessor:
         return mask
 
     @staticmethod
-    def _compute_full_median_background(
+    def _compute_sampled_background(
         video_path: str,
         max_frames: int | None,
         roi_mask: np.ndarray | None,
+        num_samples: int = 60,
     ) -> tuple[np.ndarray, float | None]:
-        """Compute median background for entire video (optionally limited by max_frames)."""
+        """Compute a sampled median background to limit memory usage."""
+
+        if num_samples <= 0:
+            raise ValueError("num_samples must be positive")
 
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             raise ValueError(f"Unable to open video: {video_path}")
 
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        if total_frames <= 0:
-            total_frames = None
-
-        if max_frames is not None and max_frames > 0:
-            frame_limit = max_frames
-        else:
-            frame_limit = total_frames
-
-        if frame_limit is None:
-            frame_limit = BackgroundProcessor._count_total_frames(video_path)
-
-        if frame_limit <= 0:
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+        if total_frames == 0:
             cap.release()
             raise ValueError("Video contains no readable frames")
 
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        if width <= 0 or height <= 0:
-            cap.release()
-            raise ValueError("Unable to determine video dimensions")
+        if max_frames is not None and max_frames > 0:
+            total_frames = min(total_frames, max_frames)
 
-        tmp_file = tempfile.NamedTemporaryFile(delete=False)
-        tmp_path = tmp_file.name
-        tmp_file.close()
-        frames_memmap: np.memmap | None = None
+        num_samples = min(num_samples, total_frames)
+        indices = np.linspace(0, total_frames - 1, num_samples).astype(int)
 
-        try:
-            frames_memmap = np.memmap(
-                tmp_path,
-                dtype=np.float32,
-                mode="w+",
-                shape=(frame_limit, height, width),
-            )
+        samples: list[np.ndarray] = []
+        for idx in indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+            ret, frame = cap.read()
+            if not ret:
+                continue
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            if roi_mask is not None:
+                gray = cv2.bitwise_and(gray, roi_mask)
+            samples.append(gray.astype(np.float32))
 
-            frame_idx = 0
-            while frame_idx < frame_limit:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                if roi_mask is not None:
-                    gray = cv2.bitwise_and(gray, roi_mask)
-                frames_memmap[frame_idx] = gray.astype(np.float32)
-                frame_idx += 1
+        cap.release()
 
-            if frame_idx == 0:
-                raise ValueError("Video contains no readable frames")
+        if not samples:
+            raise ValueError("Unable to compute sampled background")
 
-            frames_view = frames_memmap[:frame_idx]
-            background = np.median(frames_view, axis=0).astype(np.uint8)
+        stack = np.stack(samples, axis=0)
+        background = np.median(stack, axis=0).astype(np.uint8)
 
-            diff_values = np.abs(frames_view - background.astype(np.float32))
-            valid = diff_values[diff_values > 2.0]
-            frames_view = None
-        finally:
-            cap.release()
-            if frames_memmap is not None:
-                del frames_memmap
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
+        diff_values = np.abs(stack - background.astype(np.float32))
+        valid = diff_values[diff_values > 2.0]
 
         auto_threshold: float | None
         if valid.size:
@@ -1029,24 +1005,6 @@ class BackgroundProcessor:
             auto_threshold = None
 
         return background, auto_threshold
-
-    @staticmethod
-    def _count_total_frames(video_path: str) -> int:
-        """Count total readable frames in a video."""
-
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            raise ValueError(f"Unable to open video: {video_path}")
-
-        count = 0
-        while True:
-            ret, _ = cap.read()
-            if not ret:
-                break
-            count += 1
-
-        cap.release()
-        return count
 
 
     def process_frame(
