@@ -14,6 +14,10 @@ from dataclasses import dataclass, field
 from collections import deque
 from typing import NamedTuple
 
+from skimage.filters import threshold_otsu
+
+from src.mask_utils import clean_binary_mask
+
 
 class RotationState(Enum):
     """State machine states for background management."""
@@ -874,6 +878,8 @@ class BackgroundProcessor:
         rotation_stop_threshold_deg: float = 0.005,
         rotation_center: tuple[float, float] | None = None,
         max_frames: int | None = None,
+        roi_mask: np.ndarray | None = None,
+        use_auto_threshold: bool = False,
     ):
         """
         Initialize the background processor.
@@ -894,27 +900,20 @@ class BackgroundProcessor:
         self.adaptive_background = adaptive_background
         self._width = width
         self._height = height
+        self._last_background: np.ndarray | None = None
 
-        # Create circular ROI mask
-        self._roi_mask = self._create_circular_roi_mask(height, width)
+        # Create circular ROI mask (can be overridden by explicit ROI application)
+        if roi_mask is not None:
+            self._roi_mask = roi_mask
+        else:
+            self._roi_mask = self._create_circular_roi_mask(height, width)
         self._roi_center = (width // 2, height // 2)
         self._roi_radius = min(width, height) // 2
-
-        # Precompute static episode backgrounds
-        self._static_backgrounds = self._precompute_static_backgrounds(
-            video_path=video_path,
-            max_frames=max_frames,
-            background_buffer_size=background_buffer_size,
-            adaptive_background=adaptive_background,
-            rotation_start_threshold_deg=rotation_start_threshold_deg,
-            rotation_stop_threshold_deg=rotation_stop_threshold_deg,
-            rotation_center=rotation_center,
-        )
-        self._static_bg_index = 0
 
         # Initialize background manager (separate typed attributes to avoid union type issues)
         self._adaptive_manager: AdaptiveBackgroundManager | None = None
         self._rolling_manager: RollingBackgroundManager | None = None
+        self._global_background: np.ndarray | None = None
 
         if adaptive_background:
             self._adaptive_manager = AdaptiveBackgroundManager(
@@ -928,7 +927,12 @@ class BackgroundProcessor:
                 initial_center_estimate=rotation_center,
             )
         else:
-            self._rolling_manager = None
+            background, auto_threshold = self._compute_full_median_background(
+                video_path, max_frames=max_frames, roi_mask=self._roi_mask
+            )
+            self._global_background = background
+            if use_auto_threshold and auto_threshold is not None:
+                self.threshold = max(int(round(auto_threshold)), 5)
 
     @staticmethod
     def _create_circular_roi_mask(height: int, width: int) -> np.ndarray:
@@ -940,65 +944,19 @@ class BackgroundProcessor:
         return mask
 
     @staticmethod
-    def _compute_background_for_range(
-        cap: cv2.VideoCapture,
-        start_idx: int,
-        end_idx: int,
-        sample_count: int,
-    ) -> np.ndarray:
-        """Compute median background from evenly spaced frames in a range."""
-        if end_idx < start_idx:
-            raise ValueError("Invalid episode range")
-
-        n_frames = end_idx - start_idx + 1
-        n_samples = min(sample_count, n_frames)
-        indices = np.linspace(start_idx, end_idx, n_samples).astype(int)
-
-        samples = []
-        for idx in indices:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
-            ret, frame = cap.read()
-            if not ret:
-                continue
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            samples.append(gray.astype(np.float32))
-
-        if not samples:
-            raise ValueError("No frames available for background computation")
-
-        background = np.median(np.array(samples), axis=0).astype(np.uint8)
-        return background
-
-    @staticmethod
-    def _detect_static_episode_ranges(
+    def _compute_full_median_background(
         video_path: str,
         max_frames: int | None,
-        buffer_size: int,
-        rotation_start_threshold_deg: float,
-        rotation_stop_threshold_deg: float,
-        rotation_center: tuple[float, float] | None,
-    ) -> tuple[list[tuple[int, int]], int]:
-        """Detect static episode frame ranges from rotation state."""
+        roi_mask: np.ndarray | None,
+    ) -> tuple[np.ndarray, float | None]:
+        """Compute median background for entire video (optionally limited by max_frames)."""
+
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             raise ValueError(f"Unable to open video: {video_path}")
 
-        tracker = AdaptiveBackgroundManager(
-            video_path,
-            buffer_size=buffer_size,
-            rotation_start_threshold_deg=rotation_start_threshold_deg,
-            rotation_stop_threshold_deg=rotation_stop_threshold_deg,
-        )
-        tracker.initialize(
-            max_frames=max_frames, initial_center_estimate=rotation_center
-        )
-
-        ranges: list[tuple[int, int]] = []
-        in_static = True
-        episode_start = 0
+        frames: list[np.ndarray] = []
         frame_idx = 0
-        prev_state = tracker.get_state()
-        last_idx = -1
 
         while True:
             if max_frames is not None and frame_idx >= max_frames:
@@ -1007,120 +965,32 @@ class BackgroundProcessor:
             if not ret:
                 break
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            tracker.update_state(frame_idx, gray)
-            state = tracker.get_state()
-
-            if state == RotationState.STATIC:
-                if not in_static:
-                    episode_start = frame_idx
-                    in_static = True
-            else:
-                if in_static and frame_idx - 1 >= episode_start:
-                    ranges.append((episode_start, frame_idx - 1))
-                in_static = False
-
-            prev_state = state
-            last_idx = frame_idx
+            if roi_mask is not None:
+                gray = cv2.bitwise_and(gray, roi_mask)
+            frames.append(gray.astype(np.float32))
             frame_idx += 1
 
-        if in_static and last_idx >= episode_start:
-            ranges.append((episode_start, last_idx))
-
         cap.release()
-        return ranges, last_idx
 
-    def _precompute_static_backgrounds(
-        self,
-        video_path: str,
-        max_frames: int | None,
-        background_buffer_size: int,
-        adaptive_background: bool,
-        rotation_start_threshold_deg: float,
-        rotation_stop_threshold_deg: float,
-        rotation_center: tuple[float, float] | None,
-    ) -> list[tuple[int, int, np.ndarray]]:
-        """Precompute static episode backgrounds for the video."""
-        if adaptive_background:
-            ranges, last_idx = self._detect_static_episode_ranges(
-                video_path=video_path,
-                max_frames=max_frames,
-                buffer_size=background_buffer_size,
-                rotation_start_threshold_deg=rotation_start_threshold_deg,
-                rotation_stop_threshold_deg=rotation_stop_threshold_deg,
-                rotation_center=rotation_center,
-            )
+        if not frames:
+            raise ValueError("Video contains no readable frames")
+
+        stack = np.stack(frames, axis=0)
+        background = np.median(stack, axis=0).astype(np.uint8)
+
+        diff_values = np.abs(stack - background.astype(np.float32))
+        valid = diff_values[diff_values > 2.0]
+        auto_threshold: float | None
+        if valid.size:
+            try:
+                auto_threshold = float(threshold_otsu(valid))
+            except ValueError:
+                auto_threshold = None
         else:
-            cap = cv2.VideoCapture(video_path)
-            if not cap.isOpened():
-                raise ValueError(f"Unable to open video: {video_path}")
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
-            cap.release()
-            if total_frames <= 0:
-                cap = cv2.VideoCapture(video_path)
-                if not cap.isOpened():
-                    raise ValueError(f"Unable to open video: {video_path}")
-                total_frames = 0
-                while True:
-                    if max_frames is not None and total_frames >= max_frames:
-                        break
-                    ret, _ = cap.read()
-                    if not ret:
-                        break
-                    total_frames += 1
-                cap.release()
-            if max_frames is not None:
-                total_frames = (
-                    min(total_frames, max_frames) if total_frames else max_frames
-                )
-            if total_frames <= 0:
-                raise ValueError("Video has no frames")
-            ranges = [(0, total_frames - 1)]
-            last_idx = total_frames - 1
+            auto_threshold = None
 
-        if not ranges:
-            return []
+        return background, auto_threshold
 
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            raise ValueError(f"Unable to open video: {video_path}")
-
-        backgrounds: list[tuple[int, int, np.ndarray]] = []
-        for start_idx, end_idx in ranges:
-            if max_frames is not None:
-                end_idx = min(end_idx, max_frames - 1)
-            if end_idx < start_idx:
-                continue
-            background = self._compute_background_for_range(
-                cap,
-                start_idx,
-                end_idx,
-                background_buffer_size,
-            )
-            backgrounds.append((start_idx, end_idx, background))
-
-        cap.release()
-
-        if not backgrounds and last_idx >= 0:
-            raise ValueError("Failed to compute background for any episode")
-
-        return backgrounds
-
-    def _get_static_background(self, frame_idx: int) -> np.ndarray | None:
-        """Get precomputed background for a frame if available."""
-        if not self._static_backgrounds:
-            return None
-
-        while self._static_bg_index < len(self._static_backgrounds):
-            start_idx, end_idx, background = self._static_backgrounds[
-                self._static_bg_index
-            ]
-            if frame_idx < start_idx:
-                return None
-            if start_idx <= frame_idx <= end_idx:
-                return background
-            self._static_bg_index += 1
-
-        return None
 
     def process_frame(
         self,
@@ -1140,42 +1010,38 @@ class BackgroundProcessor:
             is_ready: Whether background is ready for use
         """
         if self._adaptive_manager is not None:
-            static_bg = self._get_static_background(frame_idx)
-            if static_bg is not None:
-                self._adaptive_manager.update_state(frame_idx, gray)
-                gray_bg = static_bg
-                is_ready = True
-            else:
-                gray_bg = self._adaptive_manager.get_background(frame_idx, gray)
-                is_ready = self._adaptive_manager.is_ready()
-                if not is_ready:
-                    # Return empty diff/mask when not ready
-                    return (
-                        np.zeros_like(gray),
-                        np.zeros_like(gray),
-                        False,
-                    )
-        elif self._static_backgrounds:
-            static_bg = self._get_static_background(frame_idx)
-            if static_bg is None:
+            gray_bg = self._adaptive_manager.get_background(frame_idx, gray)
+            state = self._adaptive_manager.get_state()
+            is_ready = self._adaptive_manager.is_ready() and state == RotationState.STATIC
+            if not is_ready:
                 return (
                     np.zeros_like(gray),
                     np.zeros_like(gray),
                     False,
                 )
-            gray_bg = static_bg
+        elif self._global_background is not None:
+            gray_bg = self._global_background
             is_ready = True
         else:
             raise RuntimeError("No background manager initialized")
 
         # Background subtraction
+        self._last_background = gray_bg
+
         diff = cv2.absdiff(gray, gray_bg)
         _, mask = cv2.threshold(diff, self.threshold, 255, cv2.THRESH_BINARY)
 
-        # Apply circular ROI mask
         mask = cv2.bitwise_and(mask, self._roi_mask)
+        diff = cv2.bitwise_and(diff, self._roi_mask)
+
+        mask = clean_binary_mask(mask, min_area=5)
 
         return diff, mask, is_ready
+
+    def get_last_background(self) -> np.ndarray | None:
+        """Return the most recent background image used for subtraction."""
+
+        return self._last_background
 
     def rotate_point_if_needed(
         self,

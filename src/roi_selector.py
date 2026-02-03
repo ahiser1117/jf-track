@@ -3,6 +3,23 @@ import numpy as np
 from typing import Tuple, List, Optional, Union
 
 
+def _compute_circle_from_three_points(points: list[tuple[int, int]]) -> tuple[tuple[float, float] | None, float | None]:
+    """Return center and radius from three non-collinear points."""
+    if len(points) != 3:
+        return None, None
+    (x1, y1), (x2, y2), (x3, y3) = points
+    temp = x2**2 + y2**2
+    bc = (x1**2 + y1**2 - temp) / 2.0
+    cd = (temp - x3**2 - y3**2) / 2.0
+    det = (x1 - x2) * (y2 - y3) - (x2 - x3) * (y1 - y2)
+    if abs(det) < 1e-6:
+        return None, None
+    cx = (bc * (y2 - y3) - cd * (y1 - y2)) / det
+    cy = ((x1 - x2) * cd - (x2 - x3) * bc) / det
+    radius = np.sqrt((cx - x1) ** 2 + (cy - y1) ** 2)
+    return (cx, cy), radius
+
+
 def create_circular_roi_mask(height: int, width: int, center: Optional[Tuple[float, float]] = None, 
                            radius: Optional[float] = None) -> np.ndarray:
     """
@@ -23,8 +40,14 @@ def create_circular_roi_mask(height: int, width: int, center: Optional[Tuple[flo
         center = (width // 2, height // 2)
     if radius is None:
         radius = min(width, height) // 2
-    
-    cv2.circle(mask, center, int(radius), 255, -1)
+
+    # Ensure OpenCV receives plain ints
+    center_tuple: tuple[int, int] = (
+        int(round(center[0])),
+        int(round(center[1]))
+    )
+    rad = max(int(round(radius)), 0)
+    cv2.circle(mask, center_tuple, rad, 255, -1)
     return mask
 
 
@@ -66,10 +89,30 @@ def create_auto_roi_mask(height: int, width: int) -> np.ndarray:
     return create_circular_roi_mask(height, width)
 
 
+def create_bounding_box_roi_mask(
+    height: int,
+    width: int,
+    bbox: Tuple[float, float, float, float],
+) -> np.ndarray:
+    """Create a rectangular ROI mask from (x, y, w, h)."""
+
+    mask = np.zeros((height, width), dtype=np.uint8)
+    x, y, w, h = bbox
+    x0 = max(int(round(x)), 0)
+    y0 = max(int(round(y)), 0)
+    x1 = min(int(round(x + w)), width)
+    y1 = min(int(round(y + h)), height)
+    if x1 <= x0 or y1 <= y0:
+        raise ValueError("Bounding box dimensions must be positive")
+    mask[y0:y1, x0:x1] = 255
+    return mask
+
+
 def create_roi_mask(height: int, width: int, roi_mode: str = "auto",
                   center: Optional[Tuple[float, float]] = None,
                   radius: Optional[float] = None,
-                  points: Optional[List[Tuple[float, float]]] = None) -> np.ndarray:
+                  points: Optional[List[Tuple[float, float]]] = None,
+                  bbox: Optional[Tuple[float, float, float, float]] = None) -> np.ndarray:
     """
     Factory function to create ROI masks based on mode and parameters.
     
@@ -97,6 +140,10 @@ def create_roi_mask(height: int, width: int, roi_mode: str = "auto",
         if points is None or len(points) < 3:
             raise ValueError("Polygon mode requires at least 3 points")
         return create_polygon_roi_mask(height, width, points)
+    elif roi_mode == "bounding_box":
+        if bbox is None:
+            raise ValueError("Bounding box mode requires bbox parameter")
+        return create_bounding_box_roi_mask(height, width, bbox)
     else:
         raise ValueError(f"Invalid ROI mode: {roi_mode}")
 
@@ -124,6 +171,7 @@ class ROISelector:
         self.roi_mode = "auto"
         self.circle_center = None
         self.circle_radius = None
+        self.circle_points: list[tuple[int, int]] = []
         self.polygon_points = []
         self.drawing = False
         self.selection_complete = False
@@ -135,7 +183,7 @@ class ROISelector:
         # Instructions
         self.instructions = [
             "ROI Selection Mode: Auto (press 'c' for circle, 'p' for polygon)",
-            "Circle: Click center, drag for radius, release to finish",
+            "Circle: Click three points on the boundary",
             "Polygon: Click vertices, press 'f' to finish polygon",
             "Press 'a' for auto ROI, 'r' to reset, 'q' to finish selection"
         ]
@@ -150,16 +198,17 @@ class ROISelector:
     def _circle_mouse_callback(self, event, x, y, flags):
         """Handle mouse events for circle selection."""
         if event == cv2.EVENT_LBUTTONDOWN:
-            self.drawing = True
-            self.circle_center = (x, y)
-            self.circle_radius = 0
-        
-        elif event == cv2.EVENT_MOUSEMOVE and self.drawing:
-            self.circle_radius = np.sqrt((x - self.circle_center[0])**2 + (y - self.circle_center[1])**2)
-        
-        elif event == cv2.EVENT_LBUTTONUP:
-            self.drawing = False
-            self.selection_complete = True
+            if len(self.circle_points) < 3:
+                self.circle_points.append((x, y))
+            if len(self.circle_points) == 3:
+                center, radius = _compute_circle_from_three_points(self.circle_points)
+                if center is not None and radius is not None:
+                    self.circle_center = center
+                    self.circle_radius = radius
+                    self.selection_complete = True
+                else:
+                    print("Points are collinear; please select three non-collinear points.")
+                    self.circle_points.clear()
     
     def _polygon_mouse_callback(self, event, x, y):
         """Handle mouse events for polygon selection."""
@@ -172,10 +221,17 @@ class ROISelector:
         
         # Draw ROI preview
         if self.roi_mode == "circle":
-            if self.circle_center is not None:
-                cv2.circle(overlay, self.circle_center, int(self.circle_radius or 0), (0, 255, 0), 2)
-                if self.circle_center:
-                    cv2.circle(overlay, self.circle_center, 3, (0, 0, 255), -1)
+            for px, py in self.circle_points:
+                point_int: tuple[int, int] = (int(px), int(py))
+                cv2.circle(overlay, point_int, 3, (0, 0, 255), -1)
+            if self.circle_center is not None and self.circle_radius is not None:
+                center_int: tuple[int, int] = (
+                    int(round(self.circle_center[0])),
+                    int(round(self.circle_center[1]))
+                )
+                radius = max(int(round(self.circle_radius)), 0)
+                cv2.circle(overlay, center_int, radius, (0, 255, 0), 2)
+                cv2.circle(overlay, center_int, 3, (0, 0, 255), -1)
         
         elif self.roi_mode == "polygon":
             # Draw polygon edges
@@ -219,6 +275,7 @@ class ROISelector:
                 self.roi_mode = "circle"
                 self.circle_center = None
                 self.circle_radius = None
+                self.circle_points.clear()
                 self.polygon_points = []
                 self.selection_complete = False
                 print("Switched to circle selection mode")
@@ -226,12 +283,14 @@ class ROISelector:
                 self.roi_mode = "polygon"
                 self.circle_center = None
                 self.circle_radius = None
+                self.circle_points.clear()
                 self.polygon_points = []
                 self.selection_complete = False
                 print("Switched to polygon selection mode")
             elif key == ord('r'):  # Reset
                 self.circle_center = None
                 self.circle_radius = None
+                self.circle_points.clear()
                 self.polygon_points = []
                 self.selection_complete = False
                 print("Reset selection")
@@ -277,9 +336,23 @@ def create_mask_from_config(roi_config: dict) -> np.ndarray:
     if mode == "auto":
         return create_auto_roi_mask(height, width)
     elif mode == "circle":
-        return create_circular_roi_mask(height, width, roi_config["center"], roi_config["radius"])
+        center = roi_config.get("center")
+        radius = roi_config.get("radius")
+        if center is None or radius is None:
+            # Fallback to full-frame circle if data missing
+            center = (width // 2, height // 2)
+            radius = min(width, height) // 2
+        return create_circular_roi_mask(height, width, center, radius)
     elif mode == "polygon":
-        return create_polygon_roi_mask(height, width, roi_config["points"])
+        points = roi_config.get("points")
+        if not points or len(points) < 3:
+            raise ValueError("Polygon ROI requires at least three points")
+        return create_polygon_roi_mask(height, width, points)
+    elif mode == "bounding_box":
+        bbox = roi_config.get("bbox")
+        if bbox is None:
+            raise ValueError("Bounding box ROI requires bbox data")
+        return create_bounding_box_roi_mask(height, width, bbox)
     else:
         raise ValueError(f"Unknown ROI mode: {mode}")
 
@@ -298,6 +371,8 @@ def validate_roi_config(roi_config: dict) -> bool:
         return "points" in roi_config and len(roi_config["points"]) >= 3
     elif mode == "auto":
         return True
+    elif mode == "bounding_box":
+        return "bbox" in roi_config
     else:
         return False
 

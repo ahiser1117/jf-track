@@ -83,7 +83,7 @@ def batch(video_path: str, output: str, max_frames: int) -> None:
 def sampling(video_path: str) -> None:
     """Launch the interactive feature sampler for heuristic tuning."""
     click.echo("Launching interactive feature sampler (press 'q' to finish)...")
-    run_interactive_feature_sampling(video_path)
+    run_interactive_feature_sampling(video_path, TrackingParameters())
 
 
 @test.command()

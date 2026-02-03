@@ -2,9 +2,10 @@ import cv2
 import numpy as np
 import zarr
 
-from src.tracking import get_roi_params
+from src.tracking import get_roi_params, get_roi_mask_for_video
+from src.tracker import TrackingParameters
 from src.adaptive_background import BackgroundProcessor, RotationState
-from src.save_results import load_parameters_from_zarr
+from src.save_results import load_parameters_from_zarr, load_multi_object_tracking_from_zarr
 
 
 def save_two_pass_labeled_video(
@@ -690,6 +691,8 @@ def save_multi_object_labeled_video(
     background_mode: str = "original",
     show_search_radii: bool = False,
     object_colors: dict[str, tuple[int, int, int]] | None = None,
+    composite_output_path: str | None = None,
+    show_threshold_overlay: bool = True,
 ):
     """
     Save a labeled video with multi-object tracking annotations.
@@ -704,15 +707,12 @@ def save_multi_object_labeled_video(
         background_mode: "original", "diff", or "mask"
         show_search_radii: Whether to show search radius circles
         object_colors: Optional color mapping for object types
-    
+        composite_output_path: When provided, also save a video with
+            labeled/original, background, and diff panes side by side
+
     Returns:
         None
     """
-    import cv2
-    from src.save_results import load_multi_object_tracking_from_zarr, load_parameters_from_zarr
-    from src.tracker import TrackingParameters
-    from src.adaptive_background import BackgroundProcessor
-    
     # Define default colors for different object types
     default_colors = {
         "mouth": (0, 165, 255),        # Orange
@@ -742,7 +742,10 @@ def save_multi_object_labeled_video(
     fps = cap.get(cv2.CAP_PROP_FPS)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    
+
+    video_type = getattr(params, "video_type", "non_rotating") or "non_rotating"
+    roi_mask = get_roi_mask_for_video(params, height, width, video_type)
+
     # Setup background processor
     bg_processor = BackgroundProcessor(
         video_path=video_path,
@@ -751,11 +754,27 @@ def save_multi_object_labeled_video(
         background_buffer_size=params.background_buffer_size,
         threshold=params.threshold,
         adaptive_background=params.adaptive_background,
+        rotation_start_threshold_deg=params.rotation_start_threshold_deg,
+        rotation_stop_threshold_deg=params.rotation_stop_threshold_deg,
+        rotation_center=params.rotation_center,
+        max_frames=max_frames,
+        roi_mask=roi_mask,
+        use_auto_threshold=params.use_auto_threshold and not params.adaptive_background,
     )
+    if (not params.adaptive_background) and params.use_auto_threshold:
+        params.threshold = bg_processor.threshold
     
-    # Setup video writer
+    # Setup video writer(s)
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    composite_writer = None
+    if composite_output_path:
+        composite_writer = cv2.VideoWriter(
+            composite_output_path,
+            fourcc,
+            fps,
+            (width * 3, height),
+        )
     
     # Get total frames from first object type
     first_obj_type = list(tracking_results.keys())[0]
@@ -771,7 +790,26 @@ def save_multi_object_labeled_video(
         # Get frame with background processing
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         diff, mask, is_ready = bg_processor.process_frame(frame_idx, gray)
+        background_gray = bg_processor.get_last_background() if bg_processor else None
+        if background_gray is None:
+            background_gray = gray
+
+        diff_display_gray = np.zeros_like(diff)
+        if is_ready:
+            cv2.normalize(diff, diff_display_gray, 0, 255, cv2.NORM_MINMAX)
+        bg_display = cv2.cvtColor(background_gray, cv2.COLOR_GRAY2BGR)
+        diff_display = cv2.cvtColor(diff_display_gray, cv2.COLOR_GRAY2BGR)
         
+        threshold_overlay = None
+        if show_threshold_overlay and mask is not None:
+            threshold_overlay = np.zeros_like(frame)
+            threshold_overlay[mask > 0] = (0, 0, 255)
+
+        threshold_overlay = None
+        if show_threshold_overlay and mask is not None:
+            threshold_overlay = np.zeros_like(frame)
+            threshold_overlay[mask > 0] = (0, 0, 255)
+
         if background_mode == "original":
             display_frame = frame.copy()
         elif background_mode == "diff":
@@ -780,6 +818,12 @@ def save_multi_object_labeled_video(
             display_frame = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
         else:
             display_frame = frame.copy()
+
+        if threshold_overlay is not None:
+            display_frame = cv2.addWeighted(display_frame, 0.7, threshold_overlay, 0.3, 0)
+
+        if threshold_overlay is not None:
+            display_frame = cv2.addWeighted(display_frame, 0.7, threshold_overlay, 0.3, 0)
         
         # Draw each object type
         for obj_type, tracking_data in tracking_results.items():
@@ -836,17 +880,28 @@ def save_multi_object_labeled_video(
         
         # Draw ROI boundary
         roi_params = params.get_roi_params()
-        if roi_params["mode"] == "circle" and roi_params.get("center") and roi_params.get("radius"):
-            center = roi_params["center"]
-            radius = roi_params["radius"]
-            cv2.circle(display_frame, center, int(radius), (128, 128, 128), 2)
-        elif roi_params["mode"] == "polygon" and roi_params.get("points"):
-            points = [tuple(map(int, p)) for p in roi_params["points"]]
-            cv2.polylines(display_frame, [np.array(points)], True, (128, 128, 128), 2)
-        else:  # auto
-            center = (width // 2, height // 2)
-            radius = min(width, height) // 2
-            cv2.circle(display_frame, center, radius, (128, 128, 128), 2)
+        mode = roi_params.get("mode", "auto")
+        if mode == "circle":
+            center = roi_params.get("center")
+            radius = roi_params.get("radius")
+            if center is not None and radius is not None:
+                center_int = (int(round(center[0])), int(round(center[1])))
+                radius_int = max(int(round(radius)), 0)
+                cv2.circle(display_frame, center_int, radius_int, (128, 128, 128), 2)
+            else:
+                fallback_center = (width // 2, height // 2)
+                fallback_radius = min(width, height) // 2
+                cv2.circle(display_frame, fallback_center, fallback_radius, (128, 128, 128), 2)
+        elif mode == "polygon" and roi_params.get("points"):
+            points = [tuple(int(round(px)) for px in point) for point in roi_params["points"]]
+            cv2.polylines(display_frame, [np.array(points, dtype=np.int32)], True, (128, 128, 128), 2)
+        else:  # auto or missing data
+            if video_type == "rotating":
+                center = (width // 2, height // 2)
+                radius = min(width, height) // 2
+                cv2.circle(display_frame, center, radius, (128, 128, 128), 2)
+            else:
+                cv2.rectangle(display_frame, (0, 0), (width - 1, height - 1), (128, 128, 128), 1)
         
         # Draw search radii if enabled
         if show_search_radii:
@@ -880,10 +935,50 @@ def save_multi_object_labeled_video(
         cv2.putText(display_frame, info_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
         
         out.write(display_frame)
+
+        if composite_writer is not None:
+            composite_frame = np.hstack([
+                display_frame,
+                bg_display,
+                diff_display,
+            ])
+            if threshold_overlay is not None:
+                composite_frame[:, :width] = cv2.addWeighted(
+                    composite_frame[:, :width], 0.7, threshold_overlay, 0.3, 0
+                )
+            if threshold_overlay is not None:
+                composite_frame[:, :width] = cv2.addWeighted(
+                    composite_frame[:, :width], 0.7, threshold_overlay, 0.3, 0
+                )
+            pane_titles = ["Labeled", "Background", "Diff"]
+            for idx, title in enumerate(pane_titles):
+                origin_x = idx * width + 15
+                cv2.putText(
+                    composite_frame,
+                    title,
+                    (origin_x, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 0, 0),
+                    3,
+                )
+                cv2.putText(
+                    composite_frame,
+                    title,
+                    (origin_x, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (255, 255, 255),
+                    1,
+                )
+            composite_writer.write(composite_frame)
         
         if (frame_idx + 1) % 100 == 0:
             print(f"Processing frame {frame_idx + 1}")
     
     cap.release()
     out.release()
+    if composite_writer is not None:
+        composite_writer.release()
+        print(f"Composite visualization saved to {composite_output_path}")
     print(f"Done. Saved multi-object labeled video to {output_path}")

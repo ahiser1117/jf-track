@@ -12,20 +12,20 @@ The system computes a direction vector from the bulb center-of-mass to the mouth
 
 ## Key Architecture Decisions
 
-### Rolling Background Subtraction
-Background is computed as the **median of the last N frames** (default 10), not a static image sampled across the video. This handles gradual illumination changes and is implemented in:
-- `RollingBackgroundManager` in `src/adaptive_background.py`
-- Used by both tracking (`run_two_pass_tracking`) and visualization (`save_two_pass_labeled_video`)
+### Background Subtraction Strategy
+- **Non-rotating videos**: build a single median-intensity projection using every available frame (or `max_frames` when set). The global background is thresholded once, optionally via Otsu, and reused for both tracking and visualization.
+- **Rotating videos**: rely on the adaptive background state machine from `AdaptiveBackgroundManager`. Static episodes fill a buffer that produces a median background; ROTATING/TRANSITION frames are skipped until the state returns to STATIC. `BackgroundProcessor` exposes rotation-aware helpers so search points can be rotated between episodes.
 
 ### Adaptive Background for Rotation
 When `adaptive_background=True`, the system handles videos where the background rotates:
 - Uses ORB feature matching + RANSAC to estimate frame-to-frame rotation
 - State machine: STATIC → ROTATING → TRANSITION → STATIC
-- During rotation: aligns buffered frames to current orientation before computing median
+- During rotation: aligns buffered frames to current orientation before computing median and rotates stored search points so they remain aligned with the animal
 - Automatically estimates rotation center from larger angular displacements
 
-### Circular ROI Mask
-Tracking is constrained to a circle centered at `(width/2, height/2)` with radius `min(width, height)/2`. This is because the jellyfish is expected to remain in this central region.
+### ROI Handling
+- Users can define circular, polygonal, or bounding-box ROIs via the GUI prompts or the feature-sampling workflow. These ROI settings are saved inside `TrackingParameters` and reused when visualizing results.
+- Rotating videos default to a centered circle; non-rotating videos default to a full-frame mask unless the user specifies otherwise.
 
 ### Track Merging
 The mouth may be temporarily lost (occlusion) and reacquired. `merge_mouth_tracks()` links non-overlapping track segments into one continuous track. For overlapping frames, the detection with larger area is used.
@@ -45,14 +45,14 @@ src/
 ## Key Functions
 
 ### `run_two_pass_tracking()` in `src/tracking.py`
-Main entry point. Returns `(mouth_tracking, bulb_tracking, fps)`.
+Main entry point for the legacy mouth/bulb pipeline. Returns `(mouth_tracking, bulb_tracking, fps)`.
 
 Important parameters:
-- `background_buffer_size`: Frames for rolling median (default 10)
+- `background_buffer_size`: Number of frames persisted in the adaptive background buffer. For non-rotating videos the processor ignores this and uses the full-video median background.
 - `adaptive_background`: Enable rotation compensation
 - `rotation_start_threshold_deg`: Degrees/frame to trigger rotation detection
 - `mouth_min_area`/`mouth_max_area`: Pixel area bounds for mouth detection
-- `mouth_search_radius`: Max distance (pixels) from last known position to search for mouth and bulbs when mouth is lost (None = no limit). When `adaptive_background=True` and rotation is detected, the search center rotates with the background.
+- `mouth_search_radius`: Max distance (pixels) from last known position to search for mouth and bulbs when mouth is lost (None = no limit). When `adaptive_background=True` the search center is rotated automatically when the state machine detects motion.
 - `bulb_min_area`/`bulb_max_area`: Pixel area bounds for bulb detection
 - `bulb_search_radius`: Max distance (pixels) from mouth to consider bulbs when mouth is tracked (None = no limit)
 
@@ -93,11 +93,11 @@ Arrays of shape `(n_frames,)`:
 
 ## Common Gotchas
 
-1. **Background mode in visualization**: Must use `RollingBackgroundManager` to match what tracking sees, not a static sampled background.
+1. **Background mode in visualization**: `BackgroundProcessor` is shared between tracking and both visualization paths. Always drive labeled videos through the processor rather than sampling your own background so that thresholds/ROIs stay aligned.
 
 2. **Frame indexing**: Tracking uses 0-based indices internally. The `frame` array in `TrackingData` stores frame numbers.
 
-3. **ROI mask**: Applied to binary mask after thresholding, before object detection. Anything outside the circle is ignored.
+3. **ROI mask**: Applied to binary mask after thresholding, before object detection. Rotating videos default to a centered circle; non-rotating videos default to the full frame. GUI-selectable ROIs override both behaviors.
 
 4. **Rotation center estimation**: Only reliable when cumulative rotation exceeds `_min_angle_for_center` (default 3 degrees). Uses weighted average of estimates.
 
@@ -106,7 +106,8 @@ Arrays of shape `(n_frames,)`:
 ## Testing Changes
 
 After modifying tracking logic:
-1. Run on a short clip first (`max_frames=500`)
-2. Check `visualize_adaptive_background()` output to verify background subtraction
-3. Use `background_mode="diff"` or `"mask"` in labeled video to see what tracking sees
-4. Verify ROI circle is visible in visualizations
+1. Run on a short clip first (`max_frames=500`).
+2. For rotating footage, check `visualize_adaptive_background()` to review state transitions and rotation center estimation.
+3. For non-rotating footage, confirm the full-video median background looks reasonable (no residual jellyfish).
+4. Use `background_mode="diff"` or `"mask"` in labeled video to see exactly what the tracker processed.
+5. Verify the expected ROI outline appears in visualizations (circle/polygon/bounding box), especially when loading saved `.zarr` results.

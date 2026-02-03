@@ -1,87 +1,11 @@
 import cv2
 import numpy as np
-from typing import Optional, Tuple, List
+from collections.abc import Iterable as ABCIterable
+from typing import Optional, Tuple, List, Any
 from skimage.measure import label, regionprops
 from src.tracker import RobustTracker, TrackingData, TrackingParameters
 from src.adaptive_background import BackgroundProcessor, RotationState
-
-
-class ROIMedianBackgroundProcessor:
-    """Simple ROI-aware median background builder for non-rotating videos."""
-
-    def __init__(
-        self,
-        video_path: str,
-        roi_mask: np.ndarray | None,
-        threshold: int,
-        sample_count: int = 10,
-        max_frames: int | None = None,
-    ) -> None:
-        self.threshold = threshold
-        self._roi_mask = roi_mask
-        self._has_roi = roi_mask is not None
-        self._background = self._compute_roi_median(
-            video_path, roi_mask, sample_count, max_frames
-        )
-
-    def _compute_roi_median(
-        self,
-        video_path: str,
-        roi_mask: np.ndarray | None,
-        sample_count: int,
-        max_frames: int | None,
-    ) -> np.ndarray:
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            raise ValueError(f"Could not open video: {video_path}")
-
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
-        if max_frames is not None:
-            total_frames = min(total_frames, max_frames)
-        if total_frames <= 0:
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
-
-        if total_frames == 0:
-            raise ValueError("Video contains zero frames; cannot compute background")
-
-        n_samples = min(sample_count, total_frames)
-        indices = np.linspace(0, total_frames - 1, n_samples).astype(int)
-        samples: list[np.ndarray] = []
-
-        for idx in indices:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
-            ret, frame = cap.read()
-            if not ret:
-                continue
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            if roi_mask is not None:
-                gray = cv2.bitwise_and(gray, roi_mask)
-            samples.append(gray.astype(np.float32))
-
-        cap.release()
-
-        if not samples:
-            raise ValueError("Unable to sample frames for background computation")
-
-        background = np.median(np.stack(samples, axis=0), axis=0).astype(np.uint8)
-        return background
-
-    def process_frame(
-        self, frame_idx: int, gray: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray, bool]:
-        if self._has_roi and self._roi_mask is not None:
-            gray = cv2.bitwise_and(gray, self._roi_mask)
-
-        diff = cv2.absdiff(gray, self._background)
-        _, mask = cv2.threshold(diff, self.threshold, 255, cv2.THRESH_BINARY)
-
-        if self._has_roi and self._roi_mask is not None:
-            mask = cv2.bitwise_and(mask, self._roi_mask)
-
-        return diff, mask, True
-
-    def get_roi_mask(self) -> np.ndarray | None:
-        return self._roi_mask
+from src.mask_utils import clean_binary_mask
 
 
 def rotate_point(
@@ -204,157 +128,186 @@ def compute_background(
     return background
 
 
-def detect_objects_with_stats(
+def compute_component_stats(
     binary_mask: np.ndarray,
     pixel_size_mm: float = 0.01,
-    min_area: int = 35,
-    max_area: int = 160,
 ) -> list[dict]:
-    """
-    Detects objects and calculates region properties.
+    """Compute region properties for all connected components in a mask."""
 
-    Args:
-        binary_mask: Thresholded boolean or uint8 image (0=bg, 1=object).
-        pixel_size_mm: For converting pixel lengths to mm.
-        min_area: Minimum area in pixels to consider as valid object.
-        max_area: Maximum area in pixels to consider as valid object.
-
-    Returns:
-        list: A list of dictionaries containing stats for each detected object.
-    """
-    # Label connected components
     label_img = label(binary_mask)
-
-    # Extract properties
     props = regionprops(label_img)
+    components: list[dict] = []
 
-    detections = []
-
-    for prop in props:
+    for idx, prop in enumerate(props):
         area = prop.area
+        y, x = prop.centroid
 
-        # Filter by area
-        if min_area < area < max_area:
-            # Centroid comes as (row, col) -> (y, x). We want (x, y).
-            y, x = prop.centroid
+        major_axis_length_px = getattr(
+            prop, "axis_major_length", getattr(prop, "major_axis_length", 0.0)
+        )
+        minor_axis_length_px = getattr(
+            prop, "axis_minor_length", getattr(prop, "minor_axis_length", 0.0)
+        )
 
-            # Major Axis Length (in pixels)
-            major_axis = prop.axis_major_length
+        minor_axis_length_mm = minor_axis_length_px * pixel_size_mm
+        major_axis_length_mm = major_axis_length_px * pixel_size_mm
 
-            detections.append(
-                {
-                    "centroid": (x, y),
-                    "area": area,
-                    "major_axis_length_mm": major_axis * pixel_size_mm,
-                    "bounding_box": prop.bbox,  # (min_row, min_col, max_row, max_col)
-                }
-            )
+        aspect_ratio = None
+        if minor_axis_length_px > 0:
+            aspect_ratio = major_axis_length_px / minor_axis_length_px
 
-    return detections
+        orientation_rad = getattr(prop, "orientation", 0.0)
+        orientation_deg = float(np.degrees(orientation_rad)) if orientation_rad else 0.0
+
+        components.append(
+            {
+                "component_id": idx,
+                "centroid": (x, y),
+                "area": area,
+                "major_axis_length_px": major_axis_length_px,
+                "minor_axis_length_px": minor_axis_length_px,
+                "major_axis_length_mm": major_axis_length_mm,
+                "minor_axis_length_mm": minor_axis_length_mm,
+                "aspect_ratio": aspect_ratio,
+                "eccentricity": getattr(prop, "eccentricity", 0.0),
+                "solidity": getattr(prop, "solidity", 0.0),
+                "orientation_deg": orientation_deg,
+                "bounding_box": prop.bbox,
+            }
+        )
+
+    return components
 
 
-def detect_objects_with_shape_filtering(
-    binary_mask: np.ndarray,
+def _filter_components_by_config(
+    components: list[dict],
     object_config: dict,
-    pixel_size_mm: float = 0.01,
+    *,
+    include_shape_fields: bool,
 ) -> list[dict]:
-    """
-    Enhanced object detection with shape-based filtering.
-    
-    Supports filtering by area, aspect ratio, eccentricity, and solidity.
-    Ideal for distinguishing between mouth, gonads, and tentacle bulbs.
-    
-    Args:
-        binary_mask: Thresholded boolean or uint8 image (0=bg, 1=object)
-        object_config: Object type configuration containing:
-            - min_area, max_area: Area range in pixels
-            - aspect_ratio_min, aspect_ratio_max: major/minor axis ratio range
-            - eccentricity_min, eccentricity_max: Shape eccentricity range (0=circle, 1=line)
-            - solidity_min, solidity_max: Solidity range (area/convex_hull_area)
-        pixel_size_mm: For converting pixel lengths to mm
-        
-    Returns:
-        list: Enhanced detection dictionaries with shape properties
-    """
-    # Extract configuration with defaults
-    min_area = object_config.get("min_area", 5)
-    max_area = object_config.get("max_area", 160)
+    """Filter precomputed components using an object configuration."""
+
+    min_area = object_config.get("min_area", 0)
+    max_area = object_config.get("max_area", float("inf"))
     aspect_ratio_min = object_config.get("aspect_ratio_min")
     aspect_ratio_max = object_config.get("aspect_ratio_max")
     eccentricity_min = object_config.get("eccentricity_min")
     eccentricity_max = object_config.get("eccentricity_max")
     solidity_min = object_config.get("solidity_min")
     solidity_max = object_config.get("solidity_max")
-    
-    # Label connected components
-    label_img = label(binary_mask)
-    
-    # Extract properties
-    props = regionprops(label_img)
-    
-    detections = []
-    
-    for prop in props:
-        area = prop.area
-        
-        # Area filtering (required)
+
+    detections: list[dict] = []
+
+    for component in components:
+        area = component["area"]
         if not (min_area < area < max_area):
             continue
-        
-        # Shape filtering (optional)
+
+        aspect_ratio = component["aspect_ratio"]
         if aspect_ratio_min is not None:
-            if prop.minor_axis_length > 0:
-                aspect_ratio = prop.major_axis_length / prop.minor_axis_length
-                if aspect_ratio < aspect_ratio_min:
-                    continue
-            else:
-                continue  # Skip if minor axis is zero
-        
+            if aspect_ratio is None or aspect_ratio < aspect_ratio_min:
+                continue
         if aspect_ratio_max is not None:
-            if prop.minor_axis_length > 0:
-                aspect_ratio = prop.major_axis_length / prop.minor_axis_length
-                if aspect_ratio > aspect_ratio_max:
-                    continue
-        
+            if aspect_ratio is None or aspect_ratio > aspect_ratio_max:
+                continue
+
         if eccentricity_min is not None:
-            if prop.eccentricity < eccentricity_min:
+            if component["eccentricity"] < eccentricity_min:
                 continue
-        
         if eccentricity_max is not None:
-            if prop.eccentricity > eccentricity_max:
+            if component["eccentricity"] > eccentricity_max:
                 continue
-        
+
         if solidity_min is not None:
-            if prop.solidity < solidity_min:
+            if component["solidity"] < solidity_min:
                 continue
-        
         if solidity_max is not None:
-            if prop.solidity > solidity_max:
+            if component["solidity"] > solidity_max:
                 continue
-        
-        # Extract enhanced properties
-        y, x = prop.centroid
-        major_axis = prop.axis_major_length
-        minor_axis = prop.minor_axis_length if prop.minor_axis_length > 0 else 1.0
-        
-        detections.append({
-            "centroid": (x, y),
+
+        detection = {
+            "centroid": component["centroid"],
             "area": area,
-            "major_axis_length_mm": major_axis * pixel_size_mm,
-            "minor_axis_length_mm": minor_axis * pixel_size_mm,
-            "aspect_ratio": major_axis / minor_axis,
-            "eccentricity": prop.eccentricity,
-            "solidity": prop.solidity,
-            "orientation_deg": np.degrees(prop.orientation),  # Angle of major axis
-            "bounding_box": prop.bbox,  # (min_row, min_col, max_row, max_col)
-        })
-    
-    # Limit by count if specified
+            "major_axis_length_mm": component["major_axis_length_mm"],
+            "bounding_box": component["bounding_box"],
+            "component_id": component.get("component_id"),
+        }
+
+        if include_shape_fields:
+            detection.update(
+                {
+                    "minor_axis_length_mm": component["minor_axis_length_mm"],
+                    "aspect_ratio": component["aspect_ratio"]
+                    if component["aspect_ratio"] is not None
+                    else float("inf"),
+                    "eccentricity": component["eccentricity"],
+                    "solidity": component["solidity"],
+                    "orientation_deg": component["orientation_deg"],
+                }
+            )
+
+        detections.append(detection)
+
     max_count = object_config.get("count")
     if max_count is not None and max_count > 0:
         detections = detections[:max_count]
-    
+
     return detections
+
+
+def detect_objects_with_stats(
+    binary_mask: np.ndarray | None,
+    pixel_size_mm: float = 0.01,
+    min_area: int = 35,
+    max_area: int = 160,
+    components: list[dict] | None = None,
+) -> list[dict]:
+    """Detect objects using simple area constraints."""
+
+    if components is None:
+        if binary_mask is None:
+            raise ValueError("binary_mask is required when components are not provided")
+        components = compute_component_stats(binary_mask, pixel_size_mm=pixel_size_mm)
+
+    config = {"min_area": min_area, "max_area": max_area}
+    return _filter_components_by_config(
+        components, config, include_shape_fields=False
+    )
+
+
+def detect_objects_with_shape_filtering(
+    binary_mask: np.ndarray | None,
+    object_config: dict,
+    pixel_size_mm: float = 0.01,
+    components: list[dict] | None = None,
+) -> list[dict]:
+    """
+    Enhanced object detection with shape-based filtering.
+
+    Accepts either a binary mask or precomputed component statistics for reuse
+    across multiple object types.
+    """
+
+    if components is None:
+        if binary_mask is None:
+            raise ValueError("binary_mask is required when components are not provided")
+        components = compute_component_stats(binary_mask, pixel_size_mm=pixel_size_mm)
+
+    config = {
+        "min_area": object_config.get("min_area", 5),
+        "max_area": object_config.get("max_area", 160),
+        "aspect_ratio_min": object_config.get("aspect_ratio_min"),
+        "aspect_ratio_max": object_config.get("aspect_ratio_max"),
+        "eccentricity_min": object_config.get("eccentricity_min"),
+        "eccentricity_max": object_config.get("eccentricity_max"),
+        "solidity_min": object_config.get("solidity_min"),
+        "solidity_max": object_config.get("solidity_max"),
+        "count": object_config.get("count"),
+    }
+
+    return _filter_components_by_config(
+        components, config, include_shape_fields=True
+    )
 
 
 def run_tracking(
@@ -541,6 +494,8 @@ def run_two_pass_tracking(
         rotation_stop_threshold_deg=rotation_stop_threshold_deg,
         rotation_center=rotation_center,
         max_frames=max_frames,
+        roi_mask=None,
+        use_auto_threshold=False,
     )
 
     roi_center, roi_radius = bg_processor.get_roi_params()
@@ -597,9 +552,14 @@ def run_two_pass_tracking(
 
             continue
 
+        component_stats = compute_component_stats(mask)
+
         # Detect mouth (larger objects)
         mouth_stats = detect_objects_with_stats(
-            mask, min_area=mouth_min_area, max_area=mouth_max_area
+            None,
+            min_area=mouth_min_area,
+            max_area=mouth_max_area,
+            components=component_stats,
         )
 
         # Filter mouth detections by distance from last known position if enabled
@@ -625,7 +585,10 @@ def run_two_pass_tracking(
 
         # Detect bulbs (smaller objects)
         bulb_stats = detect_objects_with_stats(
-            mask, min_area=bulb_min_area, max_area=bulb_max_area
+            None,
+            min_area=bulb_min_area,
+            max_area=bulb_max_area,
+            components=component_stats,
         )
 
         # Filter bulbs by distance from mouth position
@@ -661,14 +624,29 @@ def run_two_pass_tracking(
     cap.release()
 
     # Report rotation episodes if adaptive background was used
-    episodes = bg_processor.get_rotation_episodes()
-    if episodes:
-        print(f"\nDetected {len(episodes)} rotation episode(s):")
-        for i, ep in enumerate(episodes):
-            print(
-                f"  Episode {i + 1}: frames {ep.start_frame}-{ep.end_frame}, "
-                f"total rotation: {ep.total_rotation_deg:.1f} deg"
-            )
+    rotation_method = getattr(bg_processor, "get_rotation_episodes", None)
+    if callable(rotation_method):
+        raw_episodes = rotation_method()
+        if isinstance(raw_episodes, ABCIterable):
+            episodes = list(raw_episodes)
+        elif raw_episodes:
+            episodes = [raw_episodes]
+        else:
+            episodes = []
+        if episodes:
+            print(f"\nDetected {len(episodes)} rotation episode(s):")
+            for i, ep in enumerate(episodes):
+                start = getattr(ep, "start_frame", "?")
+                end = getattr(ep, "end_frame", "?")
+                rotation_value = getattr(ep, "total_rotation_deg", None)
+                if isinstance(rotation_value, (int, float)):
+                    rotation_text = f"{rotation_value:.1f}"
+                else:
+                    rotation_text = str(rotation_value)
+                print(
+                    f"  Episode {i + 1}: frames {start}-{end}, "
+                    f"total rotation: {rotation_text} deg"
+                )
 
     # Get data-oriented tracking results
     mouth_tracking = mouth_tracker.get_tracking_data()
@@ -876,48 +854,27 @@ def run_multi_object_tracking(
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     
-    # Create ROI mask based on configuration
-    roi_params = params.get_roi_params()
-    roi_mode = (roi_params.get("mode") or "auto").lower()
-    roi_mask = None
-    if roi_mode in {"circle", "polygon"}:
-        roi_mask = create_roi_mask(
-            height=height,
-            width=width,
-            roi_mode=roi_mode,
-            center=roi_params.get("center"),
-            radius=roi_params.get("radius"),
-            points=roi_params.get("points"),
-        )
-    elif roi_mode == "auto" and video_type == "non_rotating":
-        raise ValueError("Non-rotating mode requires a user-defined ROI (circle or polygon).")
+    roi_mask = get_roi_mask_for_video(params, height, width, video_type)
 
     # Initialize background processor
-    if video_type == "rotating":
-        params.adaptive_background = True
-        bg_processor = BackgroundProcessor(
-            video_path=video_path,
-            width=width,
-            height=height,
-            background_buffer_size=params.background_buffer_size,
-            threshold=params.threshold,
-            adaptive_background=True,
-            rotation_start_threshold_deg=params.rotation_start_threshold_deg,
-            rotation_stop_threshold_deg=params.rotation_stop_threshold_deg,
-            rotation_center=params.rotation_center,
-            max_frames=max_frames,
-        )
-    else:
-        params.adaptive_background = False
-        if roi_mask is None:
-            roi_mask = create_roi_mask(height, width, "auto", None, None, None)
-        bg_processor = ROIMedianBackgroundProcessor(
-            video_path=video_path,
-            roi_mask=roi_mask,
-            threshold=params.threshold,
-            sample_count=params.background_buffer_size,
-            max_frames=max_frames,
-        )
+    params.adaptive_background = video_type == "rotating"
+    bg_processor = BackgroundProcessor(
+        video_path=video_path,
+        width=width,
+        height=height,
+        background_buffer_size=params.background_buffer_size,
+        threshold=params.threshold,
+        adaptive_background=params.adaptive_background,
+        rotation_start_threshold_deg=params.rotation_start_threshold_deg,
+        rotation_stop_threshold_deg=params.rotation_stop_threshold_deg,
+        rotation_center=params.rotation_center,
+        max_frames=max_frames,
+        roi_mask=roi_mask,
+        use_auto_threshold=params.use_auto_threshold and not params.adaptive_background,
+    )
+    if not params.adaptive_background and params.use_auto_threshold:
+        params.threshold = bg_processor.threshold
+        print(f"Using auto threshold {params.threshold} for non-rotating background subtraction")
     
     # Initialize trackers for each enabled object type
     trackers = {}
@@ -933,6 +890,7 @@ def run_multi_object_tracking(
     # Tracking variables
     frame_idx = 0
     last_reference_position = None  # Used for spatial constraints
+    prev_state = bg_processor.get_state()
     
     print("Processing frames...")
     
@@ -947,17 +905,35 @@ def run_multi_object_tracking(
         # Background subtraction
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         diff, mask, is_ready = bg_processor.process_frame(frame_idx, gray)
-        if roi_mask is not None and mask is not None and video_type == "rotating":
-            mask = cv2.bitwise_and(mask, roi_mask)
         
+        state = bg_processor.get_state()
+        if state != prev_state:
+            if state in (RotationState.ROTATING, RotationState.TRANSITION):
+                for tracker in trackers.values():
+                    tracker.objects.clear()
+                    tracker.disappeared.clear()
+                last_reference_position = None
+            elif state == RotationState.STATIC:
+                last_reference_position = None
+            prev_state = state
+
         if not is_ready:
-            # Background not ready yet, skip this frame
+            for tracker in trackers.values():
+                tracker.update([])
             frame_idx += 1
             continue
-        
+
+        if last_reference_position is not None:
+            rotated = bg_processor.rotate_point_if_needed(last_reference_position)
+            if rotated is not None:
+                last_reference_position = rotated
+
+        component_stats = compute_component_stats(mask, pixel_size_mm=pixel_size_mm)
+        remaining_components = component_stats
+
         # Process each object type in order (mouth first as reference)
         reference_position = None
-        
+
         for obj_type in enabled_types:
             config = params.get_object_config(obj_type)
             if config is None:
@@ -965,7 +941,10 @@ def run_multi_object_tracking(
                 
             # Detect objects with shape filtering
             detections = detect_objects_with_shape_filtering(
-                mask, config, pixel_size_mm
+                None,
+                config,
+                pixel_size_mm,
+                components=remaining_components,
             )
             
             # Apply spatial constraints if we have a reference position
@@ -983,6 +962,18 @@ def run_multi_object_tracking(
             
             # Update tracker
             trackers[obj_type].update(detections)
+
+            used_component_ids = {
+                d.get("component_id")
+                for d in detections
+                if d.get("component_id") is not None
+            }
+            if used_component_ids:
+                remaining_components = [
+                    comp
+                    for comp in remaining_components
+                    if comp.get("component_id") not in used_component_ids
+                ]
             
             # Use mouth as reference position for other objects
             if obj_type == "mouth" and trackers[obj_type].objects:
@@ -999,14 +990,28 @@ def run_multi_object_tracking(
     cap.release()
     
     # Report rotation episodes if adaptive background was used
-    if params.adaptive_background:
-        episodes = bg_processor.get_rotation_episodes()
+    get_rotation_episodes = getattr(bg_processor, "get_rotation_episodes", None)
+    if params.adaptive_background and callable(get_rotation_episodes):
+        episodes_obj = get_rotation_episodes()
+        if isinstance(episodes_obj, ABCIterable):
+            episodes = list(episodes_obj)
+        elif episodes_obj:
+            episodes = [episodes_obj]
+        else:
+            episodes = []
         if episodes:
             print(f"\nDetected {len(episodes)} rotation episode(s):")
             for i, ep in enumerate(episodes):
+                start = getattr(ep, "start_frame", "?")
+                end = getattr(ep, "end_frame", "?")
+                rotation_value = getattr(ep, "total_rotation_deg", None)
+                if isinstance(rotation_value, (int, float)):
+                    rotation_text = f"{rotation_value:.1f}"
+                else:
+                    rotation_text = str(rotation_value)
                 print(
-                    f"  Episode {i + 1}: frames {ep.start_frame}-{ep.end_frame}, "
-                    f"total rotation: {ep.total_rotation_deg:.1f} deg"
+                    f"  Episode {i + 1}: frames {start}-{end}, "
+                    f"total rotation: {rotation_text} deg"
                 )
     
     # Collect tracking results
@@ -1025,7 +1030,8 @@ def run_multi_object_tracking(
 def create_roi_mask(height: int, width: int, roi_mode: str = "auto",
                   center: Optional[Tuple[float, float]] = None,
                   radius: Optional[float] = None,
-                  points: Optional[List[Tuple[float, float]]] = None) -> np.ndarray:
+                  points: Optional[List[Tuple[float, float]]] = None,
+                  bbox: Optional[Tuple[float, float, float, float]] = None) -> np.ndarray:
     """
     Create ROI mask based on mode and parameters.
     
@@ -1033,4 +1039,44 @@ def create_roi_mask(height: int, width: int, roi_mode: str = "auto",
     """
     from .roi_selector import create_roi_mask as roi_create
     
-    return roi_create(height, width, roi_mode, center, radius, points)
+    return roi_create(height, width, roi_mode, center, radius, points, bbox)
+
+
+def get_roi_mask_for_video(
+    params: TrackingParameters,
+    height: int,
+    width: int,
+    video_type: str,
+) -> np.ndarray:
+    """Build an ROI mask from tracking parameters and video type."""
+
+    roi_params = params.get_roi_params()
+    roi_mode = (roi_params.get("mode") or "auto").lower()
+
+    if roi_mode in {"circle", "polygon", "bounding_box"}:
+        roi_kwargs = {
+            "height": height,
+            "width": width,
+            "roi_mode": roi_mode,
+            "center": roi_params.get("center"),
+            "radius": roi_params.get("radius"),
+            "points": roi_params.get("points"),
+        }
+        bbox_value = roi_params.get("bbox")
+        if bbox_value is not None:
+            roi_kwargs["bbox"] = bbox_value
+        return create_roi_mask(**roi_kwargs)
+
+    if video_type.lower() == "rotating":
+        center = (width / 2.0, height / 2.0)
+        radius = min(width, height) / 2.0
+        return create_roi_mask(
+            height,
+            width,
+            "circle",
+            center=center,
+            radius=radius,
+        )
+
+    # Non-rotating default: full frame
+    return np.full((height, width), 255, dtype=np.uint8)

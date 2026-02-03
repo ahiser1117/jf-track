@@ -7,7 +7,8 @@ NOTE: This app was entirely developed using Agent-based development tools (Claud
 ## Features
 
 - **Two-pass tracking**: Detects larger features (mouth) and smaller features (bulbs) separately with different size thresholds
-- **Episode-based median background**: Computes a median background from evenly spaced frames within each static episode
+- **Full-video median (non-rotating)**: Builds a single median-intensity background from the entire non-rotating clip (or the configured `max_frames`) and reuses it for all detections
+- **Adaptive background for rotation**: Handles rotating samples with ORB + RANSAC and a STATIC/ROTATING/TRANSITION state machine that skips detections until a fresh static episode is ready
 - **Rotation-compensated background**: Handles rotating samples with ORB + RANSAC and a STATIC/ROTATING/TRANSITION state machine
 - **Direction analysis**: Computes orientation vector from bulb center-of-mass to mouth position
 - **Circular ROI masking**: Constrains tracking to central region where jellyfish is expected
@@ -49,37 +50,56 @@ pip install .
 
 ## Quick Start
 
+### Prompt-driven workflow (recommended)
+
+```
+python main.py
+```
+
+Running the entrypoint launches a small Tkinter GUI that walks through the entire configuration:
+
+1. Choose the video file.
+2. Answer whether the video is rotating (enables adaptive background automatically).
+3. Decide if you want to draw a custom ROI (circle, polygon, or bounding box). Skipping this step keeps the defaults (centered circle for rotating videos, entire frame for non-rotating videos).
+4. Decide if you want to run interactive feature sampling for automatic parameter tuning.
+5. Specify how many mouths, gonads, and tentacle bulbs are visible (bulbs can be left blank for auto-detect).
+6. Select how the background threshold should be determined. By default the app computes a per-video Otsu threshold (recommended), but you can enter a manual value if needed.
+
+After the prompts, the tracker runs with the selected parameters, saves results to `tracking_results/multi_object_tracking.zarr`, and renders two visualizations automatically:
+
+- `multi_object_labeled.mp4`: standard annotated video.
+- `multi_object_labeled_composite.mp4`: labeled frame + background + diff side by side, using the same adaptive/rolling background logic as the tracker.
+
+When the wizard asks for a frame limit, enter `1000` (for example) to run only the first thousand frames; leave it blank to process the entire video.
+
+- `debug_background.py` helps visualize raw/background/diff images and multiple thresholds before running the full tracker:
+
+```
+python debug_background.py --video path/to/video.mp4 --frame 250 --show
+python debug_background.py --video path/to/video.mp4 --frame 250 --auto-threshold --thresholds 5 10 20 --save-prefix bg_debug
+```
+
+This makes it easy to confirm that the histogram-based threshold highlights the jellyfish before running the full pipeline.
+
+### Programmatic use
+
+For scripted experiments you can still call the underlying APIs directly:
+
 ```python
 from src.tracking import run_two_pass_tracking, merge_mouth_tracks
 from src.direction_analysis import compute_direction_analysis
 from src.save_results import save_two_pass_tracking_to_zarr
 from src.visualizations import save_two_pass_labeled_video
 
-# Run tracking
 mouth_tracking_raw, bulb_tracking, fps, params = run_two_pass_tracking(
     "path/to/video.avi",
     max_frames=1000,
     background_buffer_size=10,
-    adaptive_background=True,  # Enable if background rotates
+    adaptive_background=True,
 )
-
-# Merge mouth track segments (handles occlusion gaps)
 mouth_tracking = merge_mouth_tracks(mouth_tracking_raw)
-
-# Compute direction analysis
 direction = compute_direction_analysis(mouth_tracking, bulb_tracking)
-
-# Save results
-save_two_pass_tracking_to_zarr(
-    mouth_tracking,
-    bulb_tracking,
-    direction,
-    "output.zarr",
-    fps,
-    parameters=params,
-)
-
-# Create visualization
+save_two_pass_tracking_to_zarr(mouth_tracking, bulb_tracking, direction, "output.zarr", fps, params)
 save_two_pass_labeled_video("path/to/video.avi", "output.zarr", "labeled.mp4")
 ```
 
@@ -87,15 +107,9 @@ save_two_pass_labeled_video("path/to/video.avi", "output.zarr", "labeled.mp4")
 
 ### Background Subtraction
 
-The system uses **episode-based median backgrounds** computed from evenly spaced frames within each static episode (default 10 samples). This adapts to gradual illumination changes while keeping a stable reference for subtraction.
+- **Non-rotating videos**: `BackgroundProcessor` loads the clip once, computes a median-intensity projection across every available frame (or `max_frames` if specified), and optionally derives an Otsu threshold from the residuals. This produces a single global background that matches what the tracker and labeled videos use.
 
-When `adaptive_background=False`, the entire video is treated as a single static episode.
-
-For videos where the sample rotates:
-1. Frame-to-frame rotation is estimated using ORB feature matching
-2. When rotation exceeds a threshold, the system enters "rotating" mode
-3. Buffered frames are rotated to align with the current orientation before computing the median
-4. After rotation stops, the system transitions back to static mode and builds a new static background
+- **Rotating videos**: `AdaptiveBackgroundManager` monitors frame-to-frame rotation with ORB + RANSAC, maintains a STATIC/ROTATING/TRANSITION state machine, and only produces masks during STATIC episodes. Buffered frames are rotated to align with the current orientation before computing the median, and search centers are rotated while the sample spins so they reappear in the correct coordinates when the episode stabilizes.
 
 Tracking is **skipped during ROTATING/TRANSITION** states; detections only occur during STATIC episodes.
 
@@ -110,11 +124,9 @@ Both passes use the same background-subtracted mask but with different size filt
 
 ### ROI Masking
 
-A circular region-of-interest mask constrains detection to the center of the frame:
-- Center: `(width/2, height/2)`
-- Radius: `min(width, height)/2`
-
-Objects outside this region are ignored.
+- **Rotating videos** default to a centered circle, but you can draw custom circles/polygons/bounding boxes via the GUI prompts or the interactive feature-sampling workflow. The selected ROI is stored in `TrackingParameters` and reused for downstream visualization.
+- **Non-rotating videos** default to full-frame ROI unless a custom shape is provided.
+- ROI masks are applied to binary masks after thresholding, before any connected-component analysis.
 
 ### Track Merging
 
@@ -155,19 +167,8 @@ Tracking parameters are stored in zarr attributes (`parameters`) when provided t
 
 ## Visualization
 
-The `save_two_pass_labeled_video()` function creates annotated videos with:
-- Orange circles for mouth position
-- Cyan circles for bulb positions
-- Yellow crosshair for bulb center-of-mass
-- Green arrow showing direction vector
-- Gray circle showing ROI boundary
-
-Background modes:
-- `"original"`: Original video frames
-- `"diff"`: Background subtraction difference (shows what tracking sees)
-- `"mask"`: Binary mask after thresholding
-
-`save_two_pass_labeled_video()` can auto-load tracking parameters from the zarr store to keep visualization aligned with the tracking run (thresholds, buffer size, search radii, adaptive background settings).
+- `save_multi_object_labeled_video()` (used by `main.py`) renders both the standard labeled video and an optional composite view that stacks the labeled frame, the current background image, and the diff/mask output. This composite uses the same rolling/adaptive background processor as the tracker, so what you see exactly matches what the detection step saw.
+- `save_two_pass_labeled_video()` remains available for legacy two-pass runs and supports the `"original"`, `"diff"`, and `"mask"` background modes described above. Both visualization helpers auto-load parameters from the `.zarr` output to keep overlays and search radii consistent with the tracking configuration.
 
 ## Configuration
 

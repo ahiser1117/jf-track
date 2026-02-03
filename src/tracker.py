@@ -19,6 +19,7 @@ class TrackingParameters:
     # Background subtraction (frames sampled per episode)
     background_buffer_size: int = 10
     threshold: int = 10
+    use_auto_threshold: bool = True
 
     # Legacy mouth detection parameters (for backward compatibility)
     mouth_min_area: int = 35
@@ -40,11 +41,12 @@ class TrackingParameters:
     num_gonads: int = 0  # 0-4 gonads per animal
     num_tentacle_bulbs: int | None = None  # None = auto-detect unlimited
 
-    # ROI configuration (interactive selection)
-    roi_mode: str = "auto"  # "auto", "circle", "polygon"
+    # ROI configuration (interactive selection / bounding box)
+    roi_mode: str = "auto"  # "auto", "circle", "polygon", "bounding_box"
     roi_center: tuple[float, float] | None = None  # For circle ROI
     roi_radius: float | None = None  # For circle ROI
     roi_points: list[tuple[float, float]] = field(default_factory=list)  # For polygon ROI
+    roi_bbox: tuple[float, float, float, float] | None = None  # For bounding box ROI (x, y, w, h)
 
     # Object type configurations (extensible dictionary)
     object_types: dict[str, dict] = field(default_factory=lambda: {
@@ -98,6 +100,8 @@ class TrackingParameters:
         }
     })
 
+    # Video mode and adaptive background settings
+    video_type: str = "non_rotating"
     # Adaptive background (unchanged)
     adaptive_background: bool = False
     rotation_start_threshold_deg: float = 0.01
@@ -200,7 +204,48 @@ class TrackingParameters:
             "center": self.roi_center,
             "radius": self.roi_radius,
             "points": self.roi_points,
+            "bbox": self.roi_bbox,
         }
+
+    def clear_roi(self) -> None:
+        """Reset ROI configuration to automatic mode."""
+        self.roi_mode = "auto"
+        self.roi_center = None
+        self.roi_radius = None
+        self.roi_points = []
+        self.roi_bbox = None
+
+    def apply_roi_config(self, roi_config: dict | None) -> None:
+        """Apply an ROI configuration dictionary returned from selectors."""
+
+        if not roi_config:
+            self.clear_roi()
+            return
+
+        mode = (roi_config.get("mode") or "auto").lower()
+        self.roi_mode = mode
+
+        if mode == "circle":
+            self.roi_center = tuple(roi_config.get("center", ())) or None
+            self.roi_radius = roi_config.get("radius")
+            self.roi_points = []
+            self.roi_bbox = None
+        elif mode == "polygon":
+            self.roi_points = list(roi_config.get("points", []))
+            self.roi_center = None
+            self.roi_radius = None
+            self.roi_bbox = None
+        elif mode == "bounding_box":
+            self.roi_bbox = roi_config.get("bbox")
+            self.roi_center = None
+            self.roi_radius = None
+            self.roi_points = []
+        else:
+            self.clear_roi()
+
+    def has_custom_roi(self) -> bool:
+        """Return True when ROI mode is something other than auto."""
+        return self.roi_mode in {"circle", "polygon", "bounding_box"}
 
 
 @dataclass
@@ -385,5 +430,3 @@ class RobustTracker:
     def get_tracking_data(self) -> TrackingData:
         """Convert tracker history to data-oriented TrackingData object."""
         return TrackingData.from_history(self.history, self.current_frame)
-    # Video type selection (rotating vs non-rotating)
-    video_type: str = "non_rotating"

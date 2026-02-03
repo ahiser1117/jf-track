@@ -21,39 +21,38 @@ A comprehensive jellyfish tracking system with configurable object detection, in
 
 ## 🚀 Quick Start
 
-### Interactive Mode (Recommended)
-```bash
-# Full interactive configuration with prompts (video type + ROI asked during run)
-python -m src.cli video.mp4 --interactive
+### Prompt Workflow (Recommended)
 
-# Quick non-rotating run (ROI selector launches automatically)
-python -m src.cli video.mp4 --video-type non_rotating --gonads 2 --bulbs 6
-
-# Quick rotating run (adaptive background enabled automatically)
-python -m src.cli video.mp4 --video-type rotating --gonads 2 --bulbs 8
+```
+python main.py
 ```
 
-### Batch Mode
-```bash
-# Process every .mp4 under /data/videos with the same CLI options
-python batch_process.py /data/videos --cli-args "--video-type rotating --gonads 2 --bulbs 8"
+Launching the app opens a Tkinter wizard that asks:
 
-# Limit to non-rotating videos (ROI selector will appear for each file)
-python batch_process.py ./non_rotating --cli-args "--video-type non_rotating"
-```
+1. **Video selection** – choose the clip to analyze.
+2. **Rotation** – answer “Is this video rotating?” (turns adaptive background on/off).
+3. **Custom ROI** – optionally launch the ROI selector (circle, polygon, or bounding box) for both rotating and non-rotating clips. Skipping this step keeps the defaults (centered circle for rotating videos, full-frame mask for non-rotating videos).
+4. **Parameter optimization** – decide whether to run interactive feature sampling.
+5. **Object counts** – specify mouths, gonads, and tentacle bulbs (leave bulbs blank for auto-detect).
+6. **Threshold selection** – choose automatic per-video thresholding (recommended) or enter a manual value if you already know what works for the clip.
+7. **Frame limit** – enter how many frames to process (leave blank to run the entire video). This lets you test the pipeline on the first few hundred frames before committing to a full run.
+
+After tracking completes, two videos are written automatically under `tracking_results/`:
+
+- `multi_object_labeled.mp4` – standard overlay.
+- `multi_object_labeled_composite.mp4` – labeled/original, background, and diff frames side by side so you can compare what the tracker saw.
+
+The `.zarr` store (`multi_object_tracking.zarr`) contains the multi-object tracks plus the exact `TrackingParameters` used in the run.
+
+> ❗ **Batch mode**: the legacy `batch_process.py` still targets the old flag-based CLI and is currently considered unsupported until a non-interactive configuration path is reintroduced.
 
 ## 🌀 Video Types & ROI Expectations
 
-- **Rotating videos** (`--video-type rotating`)
-  - Reuses the adaptive background manager (ORB/RANSAC rotation detection).
-  - The CLI forces `adaptive_background=True` so stationary episodes are detected automatically.
-  - ROI defaults to a centered circle; pass `--roi-type circle|polygon` to draw a custom region if needed.
+- **Rotating videos** – choose “Yes” when prompted. The adaptive background state machine (STATIC/ROTATING/TRANSITION) activates automatically, the search centers are rotated during motion, and the default ROI is a centered circle unless you draw a custom region.
 
-- **Non-rotating videos** (`--video-type non_rotating`)
-  - A custom ROI (circle or polygon) is required. The selector launches automatically and only that region is used for the median-intensity projection and background subtraction.
-  - Backgrounds are computed via a dedicated ROI median processor to honor illumination inside the drawn region.
+- **Non-rotating videos** – choose “No.” A full-video median background is computed once and reused. Auto thresholding is recommended, but you can enter a manual value or draw a custom ROI to trim the frame before background subtraction.
 
-If `--video-type` is omitted, the CLI assumes a non-rotating video and will prompt you to draw the ROI before processing each file.
+- **Visualizations** – both the standard and composite MP4s are produced automatically. The composite view reuses the same background/diff data as the rotating pipeline, making it easy to debug illumination changes.
 
 ### Testing
 ```bash
@@ -100,9 +99,9 @@ python test_multi_object_tracking.py test roi video.mp4
 - `eccentricity_max`: Maximum eccentricity for circular shapes (default: 0.7)
 
 ### ROI Configuration
-- **Non-rotating videos**: Circle or polygon ROI is mandatory. The selector launches automatically and only the drawn region is processed.
-- **Rotating videos**: ROI defaults to a centered circle. Use `--roi-type circle` or `--roi-type polygon` to launch the selector and constrain tracking.
-- Inside the selector: `a` = auto circle, `c` = circle mode, `p` = polygon mode, `r` = reset, `q` = finish.
+- **Non-rotating videos**: Default ROI is the entire frame. Select a circle, polygon, or bounding box if you want to clip processing to a smaller region.
+- **Rotating videos**: ROI defaults to a centered circle, but you can override it with circle/polygon/bounding-box selections. The stored ROI is reused when generating labeled videos.
+- Inside the selector: `a` = auto circle, `c` = circle mode, `p` = polygon mode, `r` = reset, `q` = finish. Circle mode still uses three boundary clicks to define the ROI.
 
 ## 🎮 Interactive Controls
 
@@ -112,9 +111,9 @@ python test_multi_object_tracking.py test roi video.mp4
 - `t`: Switch to tentacle bulb sampling mode
 - `u`: Undo last sample
 - `c`: Clear all samples
-- `b`: Cycle background subtraction threshold
+- `b`: Cycle the background subtraction threshold and write it back to the tracking parameters
 - `n/p`: Next/previous frame
-- `q`: Finish sampling
+- `q`: Finish sampling (you’ll be asked whether to apply ROI suggestions that were derived from your annotations)
 
 ### ROI Selection
 - `a`: Auto ROI mode
@@ -152,6 +151,7 @@ results.zarr/
 - **Track Trails**: Colored lines showing last 20 frames
 - **ROI Boundary**: Gray circle/polygon outline
 - **Search Radii**: Optional colored circles around reference positions
+- **Automatic Outputs**: Every prompt-driven run now saves two videos under the tracking results directory: `multi_object_labeled.mp4` (standard annotated view) and `multi_object_labeled_composite.mp4`, which shows the labeled frame, the current background, and the diff image side by side using the same adaptive background logic as rotating runs.
 
 ## 🔄 Backward Compatibility
 
@@ -204,7 +204,7 @@ print(f'Loaded {len(results)} object types')
 
 1. **No objects detected**
    - Try interactive feature sampling to set correct parameters
-   - Check background subtraction threshold with `--threshold`
+   - Adjust the background subtraction threshold inside `TrackingParameters` (or rerun prompts and enable feature sampling)
    - Verify ROI covers the tracking area
 
 2. **Gonads not detected**
@@ -223,10 +223,10 @@ print(f'Loaded {len(results)} object types')
 
 ### Debug Mode
 ```bash
-# Enable verbose output
-python -m src.cli video.mp4 --interactive --verbose
+# Launch the prompt-driven CLI (same as python main.py)
+python -m src.cli
 
-# Check intermediate results
+# Check intermediate results programmatically
 python -c "
 from src.tracking import run_multi_object_tracking
 from src.tracker import TrackingParameters
@@ -247,8 +247,8 @@ Multi-object tracking with configurable object types.
 #### `detect_objects_with_shape_filtering(mask, config, pixel_size_mm=0.01)`  
 Enhanced detection with aspect ratio, eccentricity, and solidity filtering.
 
-#### `run_interactive_feature_sampling(video_path)`
-Interactive clicking interface for automatic parameter tuning.
+#### `run_interactive_feature_sampling(video_path, params=None)`
+Interactive clicking interface for automatic parameter tuning. Pass an existing `TrackingParameters` instance to reuse the current ROI and threshold configuration.
 
 #### `run_interactive_roi_selection(video_path)`
 Interactive drawing interface for custom ROI selection.
@@ -281,7 +281,7 @@ class SampledFeature:
 
 ### Parameter Tuning
 1. **Start with feature sampling** to get good initial parameters
-2. **Validate with short clips** (`--max-frames 100`) before full processing
+2. **Validate with short clips** (`max_frames=100`) before full processing
 3. **Adjust shape filters** based on object morphology
 4. **Use appropriate search radii** to constrain detection areas
 
@@ -320,12 +320,4 @@ This project maintains the same license as the original jf-track system.
 
 ## 📦 Batch Processing Helper
 
-Use `batch_process.py` to iterate through every video in a directory and invoke the CLI with a consistent configuration:
-
-```bash
-python batch_process.py ./videos --pattern "*.avi" \
-  --output-root ./batch_results \
-  --cli-args "--video-type non_rotating --gonads 2 --bulbs 4"
-```
-
-Additional CLI arguments are passed verbatim to `python -m src.cli` for each video. Results for each file are written into `<output-root>/<video_stem>/`.
+The existing `batch_process.py` script still targets the old flag-based CLI and is awaiting an update. For now, script automation by importing `run_multi_object_tracking()` directly or by writing your own wrapper that supplies parameters without the GUI prompts.
