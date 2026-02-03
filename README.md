@@ -74,6 +74,14 @@ After the prompts, the tracker runs with the selected parameters, writes everyth
 
 When the wizard asks for a frame limit, enter `1000` (for example) to run only the first thousand frames; leave it blank to process the entire video.
 
+- `analyze.py` (optional): Once the run finishes, analyze tentacle-bulb pulse distances directly from the video or the results directory:
+
+```bash
+python analyze.py /path/to/video.mp4         # or /path/to/video_results/
+```
+
+The script automatically discovers `multi_object_tracking.zarr`, computes the per-frame center-of-mass of the tentacle bulbs, measures each bulb’s distance to that center, and saves both `pulse_distance.png` and `pulse_distance.csv` in the results folder. Pass `--show` to open the plot interactively, or `--no-plot` / `--no-csv` to suppress files.
+
 - `debug_background.py` helps visualize raw/background/diff images and multiple thresholds before running the full tracker:
 
 ```

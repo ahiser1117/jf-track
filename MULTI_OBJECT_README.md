@@ -43,6 +43,16 @@ After tracking completes, a folder named `<video_dir>/<video_name>_results/` is 
 - `multi_object_labeled.mp4` – standard overlay.
 - `multi_object_labeled_composite.mp4` – labeled/original, background, and diff frames side by side so you can compare what the tracker saw.
 
+### Pulse analysis (new)
+
+Use the top-level helper to visualize tentacle-bulb pulse distances straight from the video or results directory:
+
+```bash
+python analyze.py /path/to/video.mp4          # or /path/to/video_results/
+```
+
+This computes the bulb center-of-mass per frame, averages the distances from each bulb to that center, and saves both `pulse_distance.png` and `pulse_distance.csv` inside the results folder. Add `--show` to open the plot interactively or `--no-plot`/`--no-csv` to limit the outputs.
+
 > ❗ **Batch mode**: the legacy `batch_process.py` still targets the old flag-based CLI and is currently considered unsupported until a non-interactive configuration path is reintroduced.
 
 ## 🌀 Video Types & ROI Expectations
