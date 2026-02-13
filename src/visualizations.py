@@ -1,10 +1,13 @@
 import cv2
 import numpy as np
 import zarr
+from matplotlib import pyplot as plt
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 
 from src.tracking import get_roi_params, get_roi_mask_for_video
 from src.tracker import TrackingParameters
 from src.adaptive_background import BackgroundProcessor, RotationState
+from src.analysis.pulse_analysis import compute_pulse_distance_from_tracking
 from src.save_results import load_parameters_from_zarr, load_multi_object_tracking_from_zarr
 
 
@@ -1012,3 +1015,326 @@ def save_multi_object_labeled_video(
         composite_writer.release()
         print(f"Composite visualization saved to {composite_output_path}")
     print(f"Done. Saved multi-object labeled video to {output_path}")
+
+
+def save_multi_object_pulse_composite_video(
+    video_path: str,
+    zarr_path: str,
+    output_path: str,
+    *,
+    object_type: str = "tentacle_bulb",
+    max_frames: int | None = None,
+    background_mode: str = "original",
+    show_search_radii: bool = False,
+    show_bulb_hull: bool = True,
+    object_colors: dict[str, tuple[int, int, int]] | None = None,
+    plot_width: int | None = None,
+    plot_dpi: int = 110,
+) -> None:
+    """Render a labeled frame beside a live bulb-distance plot for QA."""
+
+    default_colors = {
+        "mouth": (0, 165, 255),
+        "gonad": (255, 0, 255),
+        "tentacle_bulb": (255, 200, 0),
+    }
+    colors = object_colors if object_colors is not None else default_colors
+
+    tracking_results = load_multi_object_tracking_from_zarr(zarr_path)
+    if object_type not in tracking_results:
+        available = ", ".join(sorted(tracking_results.keys()))
+        raise ValueError(
+            f"Object type '{object_type}' not found in tracking results. Available: {available}"
+        )
+
+    params = load_parameters_from_zarr(zarr_path) or TrackingParameters()
+
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    video_type = getattr(params, "video_type", "non_rotating") or "non_rotating"
+    roi_mask = get_roi_mask_for_video(params, height, width, video_type)
+    pinned_point: tuple[float, float] | None = None
+    if getattr(params, "mouth_pinned", False):
+        pinned = getattr(params, "pinned_mouth_point", None)
+        if pinned:
+            pinned_point = (float(pinned[0]), float(pinned[1]))
+
+    bg_processor = BackgroundProcessor(
+        video_path=video_path,
+        width=width,
+        height=height,
+        background_buffer_size=params.background_buffer_size,
+        threshold=params.threshold,
+        adaptive_background=params.adaptive_background,
+        rotation_start_threshold_deg=params.rotation_start_threshold_deg,
+        rotation_stop_threshold_deg=params.rotation_stop_threshold_deg,
+        rotation_start_frames=params.rotation_start_frames,
+        rotation_confidence_threshold=params.rotation_confidence_threshold,
+        min_episode_rotation_deg=params.min_episode_rotation_deg,
+        rotation_center=params.rotation_center,
+        max_frames=max_frames,
+        roi_mask=roi_mask,
+        use_auto_threshold=params.use_auto_threshold and not params.adaptive_background,
+    )
+    if (not params.adaptive_background) and params.use_auto_threshold:
+        params.threshold = bg_processor.threshold
+
+    first_obj_type = list(tracking_results.keys())[0]
+    total_frames = tracking_results[first_obj_type].n_frames
+    frame_limit = min(total_frames, max_frames or total_frames)
+
+    pulse_data = tracking_results[object_type]
+    pulse_result = compute_pulse_distance_from_tracking(
+        pulse_data,
+        fps=fps if fps > 0 else 0.0,
+        object_type=object_type,
+    )
+    distance_series = pulse_result.mean_distance_px
+    axis_values = (
+        pulse_result.time_seconds
+        if pulse_result.fps > 0
+        else pulse_result.frame_indices.astype(float)
+    )
+
+    plot_width_px = plot_width if plot_width is not None else max(400, width // 2)
+    plot_height_px = height
+    fig = plt.figure(
+        figsize=(plot_width_px / plot_dpi, plot_height_px / plot_dpi),
+        dpi=plot_dpi,
+    )
+    ax = fig.add_subplot(111)
+    ax.plot(axis_values, distance_series, color="#4cc9f0", linewidth=1.5)
+    ax.set_ylabel("Mean distance (px)")
+    ax.set_xlabel("Time (s)" if pulse_result.fps > 0 else "Frame")
+    ax.set_title(f"{object_type.replace('_', ' ').title()} pulse distance")
+    ax.grid(True, alpha=0.3)
+    cursor_line = ax.axvline(axis_values[0], color="#f72585", linewidth=2.0)
+    value_label = ax.text(
+        0.02,
+        0.9,
+        "",
+        transform=ax.transAxes,
+        fontsize=10,
+        bbox=dict(facecolor="white", alpha=0.7, edgecolor="none"),
+    )
+    fig.tight_layout()
+    canvas = FigureCanvasAgg(fig)
+    canvas.draw()
+    canvas_w, canvas_h = canvas.get_width_height()
+
+    def _plot_image(frame_idx: int, distance_value: float) -> np.ndarray:
+        axis_idx = min(frame_idx, len(axis_values) - 1)
+        cursor_line.set_xdata([axis_values[axis_idx], axis_values[axis_idx]])
+        if np.isnan(distance_value):
+            label = "Distance: N/A"
+        else:
+            label = f"Distance: {distance_value:.2f} px"
+        if pulse_result.fps > 0:
+            label += f" | t={frame_idx / pulse_result.fps:.2f}s"
+        else:
+            label += f" | frame={frame_idx}"
+        value_label.set_text(label)
+        canvas.draw()
+        buf = np.frombuffer(canvas.buffer_rgba(), dtype=np.uint8)
+        plot_rgba = buf.reshape(canvas_h, canvas_w, 4)
+        plot_bgr = cv2.cvtColor(plot_rgba, cv2.COLOR_RGBA2BGR)
+        if plot_bgr.shape[0] != height or plot_bgr.shape[1] != plot_width_px:
+            plot_bgr = cv2.resize(plot_bgr, (plot_width_px, height))
+        return plot_bgr
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(
+        output_path,
+        fourcc,
+        fps if fps > 0 else 30.0,
+        (width + plot_width_px, height),
+    )
+
+    for frame_idx in range(frame_limit):
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        diff, mask, is_ready = bg_processor.process_frame(frame_idx, gray)
+        background_gray = bg_processor.get_last_background() or gray
+
+        diff_display_gray = np.zeros_like(diff)
+        if is_ready:
+            cv2.normalize(diff, diff_display_gray, 0, 255, cv2.NORM_MINMAX)
+        bg_display = cv2.cvtColor(background_gray, cv2.COLOR_GRAY2BGR)
+        diff_display = cv2.cvtColor(diff_display_gray, cv2.COLOR_GRAY2BGR)
+        if mask is not None:
+            mask_overlay = np.zeros_like(diff_display)
+            mask_overlay[mask > 0] = (0, 0, 255)
+            diff_display = cv2.addWeighted(diff_display, 0.4, mask_overlay, 0.6, 0)
+
+        if background_mode == "original":
+            display_frame = frame.copy()
+        elif background_mode == "diff":
+            display_frame = diff_display.copy()
+        elif background_mode == "mask":
+            display_frame = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+        else:
+            display_frame = frame.copy()
+
+        for obj_name, tracking_data in tracking_results.items():
+            if obj_name not in colors:
+                continue
+            color = colors[obj_name]
+            track_ids = tracking_data.track_ids
+            x_vals = tracking_data.x
+            y_vals = tracking_data.y
+            if frame_idx >= x_vals.shape[1]:
+                continue
+            for track_idx in range(len(track_ids)):
+                x_val = x_vals[track_idx, frame_idx]
+                y_val = y_vals[track_idx, frame_idx]
+                if np.isnan(x_val) or np.isnan(y_val):
+                    continue
+                track_id = track_ids[track_idx]
+                if obj_name == "gonad":
+                    cv2.ellipse(display_frame, (int(x_val), int(y_val)), (8, 4), 0, 0, 360, color, -1)
+                    cv2.ellipse(display_frame, (int(x_val), int(y_val)), (8, 4), 0, 0, 360, (255, 255, 255), 1)
+                    marker_size = 12
+                elif obj_name == "tentacle_bulb":
+                    cv2.circle(display_frame, (int(x_val), int(y_val)), 3, color, -1)
+                    cv2.circle(display_frame, (int(x_val), int(y_val)), 3, (255, 255, 255), 1)
+                    marker_size = 6
+                else:
+                    cv2.circle(display_frame, (int(x_val), int(y_val)), 6, color, -1)
+                    cv2.circle(display_frame, (int(x_val), int(y_val)), 6, (255, 255, 255), 1)
+                    marker_size = 10
+
+                label = f"{obj_name[0].upper()}{track_id}"
+                cv2.putText(
+                    display_frame,
+                    label,
+                    (int(x_val) + marker_size // 2, int(y_val) - marker_size // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.4,
+                    color,
+                    1,
+                )
+
+                trail_start = max(0, frame_idx - 20)
+                trail_x = x_vals[track_idx, trail_start:frame_idx+1]
+                trail_y = y_vals[track_idx, trail_start:frame_idx+1]
+                for i in range(len(trail_x) - 1):
+                    if np.isnan(trail_x[i]) or np.isnan(trail_x[i+1]):
+                        continue
+                    cv2.line(
+                        display_frame,
+                        (int(trail_x[i]), int(trail_y[i])),
+                        (int(trail_x[i+1]), int(trail_y[i+1])),
+                        color,
+                        1,
+                    )
+
+        if show_bulb_hull and "tentacle_bulb" in tracking_results:
+            bulb_data = tracking_results["tentacle_bulb"]
+            if frame_idx < bulb_data.x.shape[1]:
+                points = []
+                for track_idx in range(bulb_data.n_tracks):
+                    bx = bulb_data.x[track_idx, frame_idx]
+                    by = bulb_data.y[track_idx, frame_idx]
+                    if np.isnan(bx) or np.isnan(by):
+                        continue
+                    points.append([bx, by])
+                if len(points) >= 3:
+                    pts = np.array(points, dtype=np.float32)
+                    hull = cv2.convexHull(pts.reshape(-1, 1, 2))
+                    cv2.polylines(display_frame, [hull.astype(int)], True, (255, 255, 255), 2)
+
+        roi_params = params.get_roi_params()
+        mode = roi_params.get("mode", "auto")
+        if mode == "circle":
+            center = roi_params.get("center")
+            radius = roi_params.get("radius")
+            if center is not None and radius is not None:
+                center_int = (int(round(center[0])), int(round(center[1])))
+                radius_int = max(int(round(radius)), 0)
+                cv2.circle(display_frame, center_int, radius_int, (128, 128, 128), 2)
+        elif mode == "polygon" and roi_params.get("points"):
+            points = [tuple(int(round(px)) for px in point) for point in roi_params["points"]]
+            cv2.polylines(display_frame, [np.array(points, dtype=np.int32)], True, (128, 128, 128), 2)
+        else:
+            if video_type == "rotating":
+                center = (width // 2, height // 2)
+                radius = min(width, height) // 2
+                cv2.circle(display_frame, center, radius, (128, 128, 128), 2)
+            else:
+                cv2.rectangle(display_frame, (0, 0), (width - 1, height - 1), (128, 128, 128), 1)
+
+        if params.mouth_pinned and pinned_point is not None:
+            pin_int = (int(round(pinned_point[0])), int(round(pinned_point[1])))
+            cv2.drawMarker(
+                display_frame,
+                pin_int,
+                (0, 165, 255),
+                markerType=cv2.MARKER_TILTED_CROSS,
+                markerSize=12,
+                thickness=2,
+            )
+
+        if show_search_radii:
+            mouth_pos: tuple[int, int] | None = None
+            if "mouth" in tracking_results:
+                mouth_x = tracking_results["mouth"].x
+                mouth_y = tracking_results["mouth"].y
+                if frame_idx < mouth_x.shape[1]:
+                    mx = mouth_x[0, frame_idx]
+                    my = mouth_y[0, frame_idx]
+                    if not np.isnan(mx):
+                        mouth_pos = (int(mx), int(my))
+            if mouth_pos is None and pinned_point is not None:
+                mouth_pos = (int(round(pinned_point[0])), int(round(pinned_point[1])))
+            if mouth_pos is not None:
+                if params.mouth_search_radius:
+                    cv2.circle(display_frame, mouth_pos, params.mouth_search_radius, (0, 165, 255), 1)
+                if params.bulb_search_radius:
+                    cv2.circle(display_frame, mouth_pos, params.bulb_search_radius, (255, 200, 0), 1)
+
+        current_distance = (
+            distance_series[frame_idx]
+            if frame_idx < len(distance_series)
+            else float("nan")
+        )
+        info_text = f"Frame {frame_idx + 1}/{frame_limit}"
+        if np.isnan(current_distance):
+            info_text += " | Pulse distance: N/A"
+        else:
+            info_text += f" | Pulse distance: {current_distance:.2f}px"
+        cv2.putText(
+            display_frame,
+            info_text,
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 255),
+            2,
+        )
+        cv2.putText(
+            display_frame,
+            info_text,
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 0, 0),
+            1,
+        )
+
+        plot_image = _plot_image(frame_idx, current_distance)
+        combined = np.hstack([display_frame, plot_image])
+        writer.write(combined)
+
+        if (frame_idx + 1) % 100 == 0:
+            print(f"Rendered {frame_idx + 1}/{frame_limit} frames")
+
+    cap.release()
+    writer.release()
+    plt.close(fig)
+    print(f"Saved pulse composite video to {output_path}")

@@ -13,7 +13,10 @@ try:  # pragma: no cover - normal execution inside package
     from src.tracker import TrackingParameters
     from src.tracking import run_multi_object_tracking
     from src.save_results import save_multi_object_tracking_to_zarr
-    from src.visualizations import save_multi_object_labeled_video
+    from src.visualizations import (
+        save_multi_object_labeled_video,
+        save_multi_object_pulse_composite_video,
+    )
 except ModuleNotFoundError:  # pragma: no cover - direct script execution fallback
     import sys
 
@@ -26,7 +29,10 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution fallba
     from src.tracker import TrackingParameters
     from src.tracking import run_multi_object_tracking
     from src.save_results import save_multi_object_tracking_to_zarr
-    from src.visualizations import save_multi_object_labeled_video
+    from src.visualizations import (
+        save_multi_object_labeled_video,
+        save_multi_object_pulse_composite_video,
+    )
 
 
 def _run_cli(args: list[str]) -> None:
@@ -122,6 +128,36 @@ def visualization(video_path: str, output: str, max_frames: int) -> None:
     )
 
     click.echo(f"Visualization saved to {output}")
+
+
+@test.command()
+@click.argument('video_path', type=click.Path(exists=True, dir_okay=False))
+@click.option('--output', default='./test_pulse_composite.mp4', help='Output composite video path')
+@click.option('--max-frames', type=int, default=150, help='Limit frames to keep render fast')
+@click.option('--object-type', default='tentacle_bulb', show_default=True, help='Object type for the pulse trace')
+def pulse(video_path: str, output: str, max_frames: int, object_type: str) -> None:
+    """Run a short tracking session and render the synced pulse composite video."""
+
+    click.echo("Running tracking for pulse composite...")
+    params = TrackingParameters()
+    params.num_gonads = 2
+    params.num_tentacle_bulbs = 6
+    params.update_object_counts()
+
+    tracking_results, fps = run_multi_object_tracking(video_path, params, max_frames)
+    temp_zarr = Path(output).with_suffix('.zarr')
+    save_multi_object_tracking_to_zarr(tracking_results, str(temp_zarr), fps, params)
+
+    click.echo("Rendering pulse composite video...")
+    save_multi_object_pulse_composite_video(
+        video_path=video_path,
+        zarr_path=str(temp_zarr),
+        output_path=output,
+        object_type=object_type,
+        max_frames=max_frames,
+    )
+
+    click.echo(f"Pulse composite saved to {output}")
 
 
 if __name__ == '__main__':

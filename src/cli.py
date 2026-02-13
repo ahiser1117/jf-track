@@ -13,7 +13,10 @@ from src.roi_selector import run_interactive_roi_selection
 from src.gui_prompts import prompt_for_tracking_configuration, PromptResult
 from src.interactive_sampling import run_interactive_feature_sampling
 from src.save_results import save_multi_object_tracking_to_zarr
-from src.visualizations import save_multi_object_labeled_video
+from src.visualizations import (
+    save_multi_object_labeled_video,
+    save_multi_object_pulse_composite_video,
+)
 from src.tracker import TrackingParameters
 from src.tracking import run_multi_object_tracking
 
@@ -176,7 +179,11 @@ def _resolve_results_dir(video_path: str) -> Path:
     return output_dir
 
 
-def run_prompted_tracking() -> None:
+def run_prompted_tracking(
+    *,
+    pulse_video: bool = False,
+    pulse_object_type: str = "tentacle_bulb",
+) -> None:
     click.echo("jf-track Prompt Workflow")
     click.echo("==========================")
 
@@ -215,6 +222,23 @@ def run_prompted_tracking() -> None:
         max_frames=prompt.max_frames,
     )
 
+    if pulse_video:
+        pulse_video_path = output_dir / "multi_object_labeled_pulse.mp4"
+        click.echo(
+            f"Rendering pulse composite video to {pulse_video_path} (object_type={pulse_object_type})..."
+        )
+        try:
+            save_multi_object_pulse_composite_video(
+                video_path=prompt.video_path,
+                zarr_path=str(zarr_path),
+                output_path=str(pulse_video_path),
+                object_type=pulse_object_type,
+                max_frames=prompt.max_frames,
+                show_bulb_hull=True,
+            )
+        except Exception as exc:  # pragma: no cover - visualization optional
+            click.echo(f"Pulse composite rendering failed: {exc}")
+
     click.echo("Tracking completed successfully.")
     click.echo(f"Results saved to {zarr_path}")
     click.echo(f"Labeled video saved to {labeled_video_path}")
@@ -222,10 +246,24 @@ def run_prompted_tracking() -> None:
 
 
 @click.command()
-def track_jellyfish() -> None:
+@click.option(
+    "--pulse-video/--no-pulse-video",
+    default=False,
+    help="Also render a composite video with a synced pulse-distance plot.",
+)
+@click.option(
+    "--pulse-object-type",
+    default="tentacle_bulb",
+    show_default=True,
+    help="Object type to use for the pulse-distance plot.",
+)
+def track_jellyfish(pulse_video: bool, pulse_object_type: str) -> None:
     """Entry point: launch the prompt-driven tracking workflow."""
 
-    run_prompted_tracking()
+    run_prompted_tracking(
+        pulse_video=pulse_video,
+        pulse_object_type=pulse_object_type,
+    )
 
 
 if __name__ == "__main__":

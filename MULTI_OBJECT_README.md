@@ -20,10 +20,10 @@ A comprehensive jellyfish tracking system with configurable object detection, in
 - **Multi-Pass Pipeline**: Mouth → Gonads → Tentacle Bulbs
 
 ### Object Permanence
-- Mouth detections create a smoothed reference point; gonad and bulb detections must stay outside the configurable `mouth_exclusion_radius` and within their own `track_search_radius` to be considered valid.
-- Each object type can define both `search_radius` (relative to the mouth) and `track_search_radius` (relative to its own history), which keeps reassociation local and prevents identity swapping.
-- After mouth components are claimed, those connected components are removed from the candidate pool so gonads and bulbs cannot reuse the same blob within the same frame.
-- Detections are scored for every object type (shape, distance, overlap penalties). A component is only claimed by an object if its score exceeds competing classes (with a configurable margin), so gonads and bulbs no longer steal each other’s regions during brief overlaps.
+- Mouth detections (or the pinned reference) create a smoothed reference point that downstream classes can follow even when the current frame lacks a mouth detection.
+- Each object type defines both `search_radius` (relative to a reference object such as the mouth) and `track_search_radius` (relative to its own smoothed history), keeping reassociation local. `ownership_radius` further dampens identity swaps when multiple detections cluster together.
+- `exclude_objects` and per-class `score_margin` rules penalize components that drift too close to other object types, ensuring gonads and bulbs only claim blobs when they clearly win the scoring comparison.
+- Once a component is claimed, it is removed from the candidate pool so later passes cannot reuse the same blob in the same frame.
 
 ## 🚀 Quick Start
 
@@ -48,6 +48,9 @@ After tracking completes, a folder named `<video_dir>/<video_name>_results/` is 
 - `multi_object_tracking.zarr` – the full set of tracks and run parameters.
 - `multi_object_labeled.mp4` – standard overlay.
 - `multi_object_labeled_composite.mp4` – labeled/original, background, and diff frames side by side so you can compare what the tracker saw.
+- `multi_object_labeled_pulse.mp4` – optional QA composite (created when you pass `--pulse-video`) pairing the labeled frame with a live pulse-distance plot cursor.
+
+Run `python main.py --pulse-video` (or `--pulse-video --pulse-object-type gonad`) to generate the pulse composite automatically at the end of the workflow.
 
 ### Pulse analysis (new)
 
@@ -73,19 +76,22 @@ This computes the bulb center-of-mass per frame, averages the distances from eac
 ### Testing
 ```bash
 # Test interactive workflow
-python test_multi_object_tracking.py test interactive video.mp4
+python test_multi_object_tracking.py interactive video.mp4
 
 # Test batch mode
-python test_multi_object_tracking.py test batch video.mp4
+python test_multi_object_tracking.py batch video.mp4
 
-# Test visualization
-python test_multi_object_tracking.py test visualization video.mp4
+# Test visualization rendering
+python test_multi_object_tracking.py visualization video.mp4 --output labeled.mp4
 
-# Test feature sampling
-python test_multi_object_tracking.py test sampling video.mp4
+# Test feature sampling helper
+python test_multi_object_tracking.py sampling video.mp4
 
-# Test ROI selection
-python test_multi_object_tracking.py test roi video.mp4
+# Test ROI selector
+python test_multi_object_tracking.py roi video.mp4
+
+# Test synced pulse composite
+python test_multi_object_tracking.py pulse video.mp4 --output pulse.mp4
 ```
 
 ## 📋 Configuration Options
@@ -203,13 +209,13 @@ python -c "from src.roi_selector import run_interactive_roi_selection"
 
 ### Integration Tests
 ```bash
-# Test full pipeline with sample video
-python test_multi_object_tracking.py sample_video.mp4 test interactive
+# Test full pipeline with a sample video (limiting frames for speed)
+python test_multi_object_tracking.py interactive sample_video.mp4 --max-frames 200
 
 # Validate results
 python -c "
 from src.save_results import load_multi_object_tracking_from_zarr
-results = load_multi_object_tracking_from_zarr('output.zarr')
+results = load_multi_object_tracking_from_zarr('sample_video_results/multi_object_tracking.zarr')
 print(f'Loaded {len(results)} object types')
 "
 ```

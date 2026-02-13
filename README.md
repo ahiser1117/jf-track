@@ -1,18 +1,18 @@
 # jf-track
 
-A video tracking system for jellyfish microscopy, featuring two-pass detection of anatomical features and adaptive background subtraction for rotating backgrounds.
+jf-track is a prompt-driven jellyfish tracking toolkit with a configurable multi-object pipeline (mouth, gonads, tentacle bulbs) and a legacy two-pass mode for backwards compatibility.
 
-NOTE: This app was entirely developed using Agent-based development tools (Claude Code, Codex, OpenCode).
+NOTE: This app was entirely developed using agent-based development tools (Claude Code, Codex, OpenCode).
 
 ## Features
 
-- **Two-pass tracking**: Detects larger features (mouth) and smaller features (bulbs) separately with different size thresholds
-- **Full-video median (non-rotating)**: Builds a single median-intensity background from the entire non-rotating clip (or the configured `max_frames`) and reuses it for all detections
-- **Adaptive background for rotation**: Handles rotating samples with ORB + RANSAC and a STATIC/ROTATING/TRANSITION state machine that skips detections until a fresh static episode is ready
-- **Rotation-compensated background**: Handles rotating samples with ORB + RANSAC and a STATIC/ROTATING/TRANSITION state machine
-- **Direction analysis**: Computes orientation vector from bulb center-of-mass to mouth position
-- **Circular ROI masking**: Constrains tracking to central region where jellyfish is expected
-- **Search-radius filtering**: Optional spatial filters for mouth re-acquisition and bulb detection
+- **Prompted multi-object workflow** – `python main.py` launches a Tkinter wizard that captures video metadata, rotation/pinned-mouth choices, ROI selection, and class counts before running the modern multi-pass tracker.
+- **Class-specific heuristics** – Mouth/gonad/bulb passes reuse component statistics but apply independent area/shape filters plus `search_radius`, `track_search_radius`, `ownership_radius`, `exclude_objects`, and score margins to keep labels stable.
+- **Adaptive & static backgrounds** – Non-rotating clips use a 60-sample median projection (with optional Otsu threshold). Rotating clips rely on the adaptive ORB+RANSAC state machine (STATIC → ROTATING → TRANSITION), which pauses detections during motion and rotates stored search points.
+- **Interactive tools** – ROI selector (circle/polygon/bounding box), feature sampler, and pinned-mouth workflows feed their configuration straight into `TrackingParameters`, so downstream visualizations reproduce the same ROI, search radii, and thresholds.
+- **Visualization & analysis** – Every run emits `multi_object_tracking.zarr`, `multi_object_labeled.mp4`, and the composite diff/background video. `analyze.py` produces pulse-distance plots/CSVs, while `debug_background.py` previews thresholds.
+- **Pulse QA composite** – Optional `--pulse-video` flag renders a second MP4 that pairs the labeled frame with a live pulse-distance plot cursor so you can spot-check the timing of swim cycles.
+- **Legacy compatibility** – `run_two_pass_tracking()` and the original `save_two_pass_*` helpers remain available when only mouth + bulb tracking is required.
 
 ## Installation
 
@@ -56,7 +56,7 @@ pip install .
 python main.py
 ```
 
-Running the entrypoint launches a small Tkinter GUI that walks through the entire configuration:
+Running the entrypoint launches a Tkinter GUI that walks through the configuration:
 
 1. Choose the video file.
 2. Answer whether the video is rotating (enables adaptive background automatically).
@@ -66,15 +66,16 @@ Running the entrypoint launches a small Tkinter GUI that walks through the entir
 6. Specify how many mouths, gonads, and tentacle bulbs are visible (bulbs can be left blank for auto-detect). When the mouth is pinned the count is forced to zero automatically.
 7. Enter an optional frame limit (leave blank to process the full clip).
 
-After the prompts, the tracker runs with the selected parameters, writes everything to a per-video folder named `<video_dir>/<video_name>_results/`, and renders two visualizations automatically:
+After the prompts, the tracker runs with the captured parameters, writes everything to `<video_dir>/<video_name>_results/`, and renders:
 
-- `multi_object_tracking.zarr`: multi-object tracking results.
-- `multi_object_labeled.mp4`: standard annotated video.
-- `multi_object_labeled_composite.mp4`: labeled frame + background + diff side by side, using the same adaptive/rolling background logic as the tracker.
+- `multi_object_tracking.zarr`: per-object tracking arrays plus serialized `TrackingParameters`.
+- `multi_object_labeled.mp4`: standard overlay.
+- `multi_object_labeled_composite.mp4`: labeled frame + background + diff panes, all backed by the same `BackgroundProcessor` instance used for tracking.
+- `multi_object_labeled_pulse.mp4` (when `--pulse-video` is provided): labeled frame on the left, synced bulb-distance plot with a moving cursor on the right.
 
 When the wizard asks for a frame limit, enter `1000` (for example) to run only the first thousand frames; leave it blank to process the entire video.
 
-- `analyze.py` (optional): Once the run finishes, analyze tentacle-bulb pulse distances directly from the video or the results directory:
+- `analyze.py` (optional): once the run finishes, analyze tentacle-bulb pulse distances directly from the video or the results directory:
 
 ```bash
 python analyze.py /path/to/video.mp4         # or /path/to/video_results/
@@ -89,11 +90,42 @@ python debug_background.py --video path/to/video.mp4 --frame 250 --show
 python debug_background.py --video path/to/video.mp4 --frame 250 --auto-threshold --thresholds 5 10 20 --save-prefix bg_debug
 ```
 
-If you skip feature sampling, the tracker falls back to the automatic per-video threshold from the background processor. `debug_background.py` remains a handy way to preview that threshold before you run the full pipeline.
+If you skip feature sampling, the tracker falls back to the automatic per-video threshold derived from the sampled background. `debug_background.py` remains a handy way to preview that threshold before you run the full pipeline.
+
+Need a synced QA artifact? Launch the prompt workflow with `--pulse-video` to generate the pulse composite automatically (use `--pulse-object-type gonad` to visualize other classes). The extra MP4 lives alongside the standard outputs.
 
 ### Programmatic use
 
-For scripted experiments you can still call the underlying APIs directly:
+For scripted experiments you can call either the modern multi-object API or the legacy two-pass helper.
+
+```python
+from src.tracking import run_multi_object_tracking
+from src.tracker import TrackingParameters
+from src.save_results import save_multi_object_tracking_to_zarr
+from src.visualizations import save_multi_object_labeled_video
+
+params = TrackingParameters()
+params.video_type = "rotating"
+params.num_gonads = 2
+params.num_tentacle_bulbs = 8
+params.update_object_counts()
+
+results, fps = run_multi_object_tracking(
+    "path/to/video.mp4",
+    params,
+    max_frames=500,
+)
+save_multi_object_tracking_to_zarr(results, "output.zarr", fps, params)
+save_multi_object_labeled_video(
+    video_path="path/to/video.mp4",
+    zarr_path="output.zarr",
+    output_path="labeled.mp4",
+    composite_output_path="labeled_composite.mp4",
+    show_search_radii=True,
+)
+```
+
+Legacy two-pass usage:
 
 ```python
 from src.tracking import run_two_pass_tracking, merge_mouth_tracks
@@ -117,76 +149,38 @@ save_two_pass_labeled_video("path/to/video.avi", "output.zarr", "labeled.mp4")
 
 ### Background Subtraction
 
-- **Non-rotating videos**: `BackgroundProcessor` samples up to 60 evenly spaced frames (respecting `max_frames` when provided), computes a median-intensity projection from those samples, and optionally derives an Otsu threshold from the residuals. This produces a single global background that matches what the tracker and labeled videos use, without loading the entire video into memory.
+- **Non-rotating videos** – `BackgroundProcessor` samples up to 60 evenly spaced frames (respecting `max_frames`), computes a median background, and optionally derives an Otsu threshold from the residuals. The same background feeds both tracking and labeled videos.
+- **Rotating videos** – `AdaptiveBackgroundManager` estimates rotation with ORB + RANSAC, tracks STATIC/ROTATING/TRANSITION states, and aligns buffered frames to the current orientation before recomputing the median. Search points (mouth history, ROI vertices, pinned references) are rotated while motion occurs. Tracking resumes only when the state returns to STATIC.
 
-- **Rotating videos**: `AdaptiveBackgroundManager` monitors frame-to-frame rotation with ORB + RANSAC, maintains a STATIC/ROTATING/TRANSITION state machine, and only produces masks during STATIC episodes. Buffered frames are rotated to align with the current orientation before computing the median, and search centers are rotated while the sample spins so they reappear in the correct coordinates when the episode stabilizes.
-- Rotation detection now requires multiple consecutive high-confidence angle estimates and ignores any episode whose total rotation is below `min_episode_rotation_deg` (default 5°). This prevents jitter/noise from pausing tracking unnecessarily.
+### Multi-Object Detection
 
-Tracking is **skipped during ROTATING/TRANSITION** states; detections only occur during STATIC episodes.
-
-### Two-Pass Detection
-
-Objects are detected using connected component analysis on the background-subtracted binary mask:
-
-1. **Mouth detection**: Finds objects with area between `mouth_min_area` and `mouth_max_area` (default 35-160 pixels)
-2. **Bulb detection**: Finds smaller objects between `bulb_min_area` and `bulb_max_area` (default 5-35 pixels)
-
-Both passes use the same background-subtracted mask but with different size filters.
+- The background-subtracted binary mask is reused for each enabled object type. Components are filtered by class-specific area/shape ranges and then rescored using the configured heuristics.
+- `search_radius` + `track_search_radius` keep detections local to either the mouth reference or each tracker’s smoothed centroid history.
+- `ownership_radius`, `exclude_objects`, and configurable `score_margin` comparisons ensure components are only claimed when the class clearly wins, preventing gonad/bulb swaps when blobs overlap.
+- Accepted components are removed from contention so downstream passes cannot reuse the same blob. Pinned-mouth mode bypasses detection entirely but still provides a reference point for gonads/bulbs.
 
 ### ROI Masking
 
-- **Rotating videos** default to a centered circle, but you can draw custom circles/polygons/bounding boxes via the GUI prompts or the interactive feature-sampling workflow. The selected ROI is stored in `TrackingParameters` and reused for downstream visualization.
-- **Non-rotating videos** default to full-frame ROI unless a custom shape is provided.
-- ROI masks are applied to binary masks after thresholding, before any connected-component analysis.
+- Rotating videos default to a centered circle; non-rotating videos default to the full frame. Interactive selectors or feature sampling can persist a circle, polygon, or bounding-box ROI that downstream visualizations reuse.
+- Masks are applied immediately after thresholding and before measuring connected components.
 
-### Object Permanence Heuristics
+### Legacy Two-Pass & Track Merging
 
-- Mouth detections seed a smoothed reference position. Gonads and bulbs automatically discard detections that fall inside the configured `mouth_exclusion_radius` or that jump too far from their last smoothed centroid.
-- Each object type has a dedicated `search_radius` (relative to the mouth) and a `track_search_radius` (relative to its own tracks) so reassociation favors spatially nearby detections and resists sudden swaps.
-- Components claimed by the mouth are removed from the candidate list before evaluating downstream objects, which prevents gonads or bulbs from reusing the same blobs in the same frame.
-- Every connected component is scored for each enabled object type (shape + distance + overlap penalties). When gonad and bulb candidates conflict, the higher-scoring class keeps the component, so brief overlaps no longer trigger label switching.
+- The legacy two-pass helper still runs mouth+bulb detection with area-only constraints. `merge_mouth_tracks()` can combine fragmented mouth segments into a continuous track for that mode.
 
-### Track Merging
+### Direction & Pulse Analysis
 
-The mouth may be temporarily lost due to occlusion. The `merge_mouth_tracks()` function links non-overlapping track segments into a single continuous track. When tracks overlap (rare), the track closest to the last known position is preferred; if no prior position exists, the larger-area detection is used.
-
-### Direction Analysis
-
-For each frame, the system computes:
-- Bulb center-of-mass (average position of all detected bulbs)
-- Direction vector from bulb CoM to mouth
-- Direction angle and magnitude (0° = right, 90° = up in image coordinates)
-
-Positions are temporally smoothed to reduce noise.
+- `compute_direction_analysis()` calculates bulb center-of-mass → mouth vectors (with smoothing) and stores direction arrays for the two-pass workflow. `analyze.py` reads the multi-object `.zarr` to compute pulse-distance series and optionally emit `pulse_distance.png/.csv`.
 
 ## Output Format
 
-Results are stored in zarr format with the following structure:
-
-```
-output.zarr/
-├── mouth/
-│   ├── track     # Track IDs
-│   ├── x, y      # Positions (n_tracks, n_frames)
-│   ├── area      # Detection area
-│   └── ...
-├── bulb/
-│   └── ...       # Same structure as mouth
-└── direction/
-    ├── mouth_x, mouth_y
-    ├── bulb_com_x, bulb_com_y
-    ├── bulb_count
-    ├── direction_x, direction_y
-    ├── direction_magnitude
-    └── direction_angle_deg
-```
-
-Tracking parameters are stored in zarr attributes (`parameters`) when provided to `save_two_pass_tracking_to_zarr()`.
+- `multi_object_tracking.zarr` contains one group per enabled object type (`mouth/`, `gonad/`, `tentacle_bulb/`, etc.). Each group mirrors the `TrackingData` arrays (`track`, `x`, `y`, `area`, `bbox_*`, `frame`). Global attributes store `fps`, `object_types`, and the serialized `TrackingParameters`.
+- Legacy runs that call `save_two_pass_tracking_to_zarr()` produce `mouth/`, `bulb/`, and `direction/` groups plus the same parameter metadata.
 
 ## Visualization
 
-- `save_multi_object_labeled_video()` (used by `main.py`) renders both the standard labeled video and an optional composite view that stacks the labeled frame, the current background image, and the diff/mask output. This composite uses the same rolling/adaptive background processor as the tracker, so what you see exactly matches what the detection step saw.
-- `save_two_pass_labeled_video()` remains available for legacy two-pass runs and supports the `"original"`, `"diff"`, and `"mask"` background modes described above. Both visualization helpers auto-load parameters from the `.zarr` output to keep overlays and search radii consistent with the tracking configuration.
+- `save_multi_object_labeled_video()` renders both the standard labeled video and an optional composite view that stacks the labeled frame, current background, and diff/mask output. Because it reuses the same `BackgroundProcessor`, overlays stay aligned with what the tracker processed.
+- `save_two_pass_labeled_video()` remains available for legacy runs and supports the `"original"`, `"diff"`, and `"mask"` background modes.
 
 ## Configuration
 

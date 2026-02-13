@@ -8,6 +8,7 @@ import numpy as np
 import zarr
 
 from src.save_results import load_multi_object_tracking_from_zarr
+from src.tracker import TrackingData
 
 
 @dataclass
@@ -28,22 +29,14 @@ def _read_fps(zarr_path: str | Path) -> float:
         return 0.0
 
 
-def compute_pulse_distance_series(
-    zarr_path: str | Path,
+def compute_pulse_distance_from_tracking(
+    tracking: TrackingData,
     *,
-    object_type: str = "tentacle_bulb",
+    fps: float,
+    object_type: str,
 ) -> PulseAnalysisResult:
-    """Compute mean bulb distance from center-of-mass for every frame."""
+    """Compute pulse distance statistics from an in-memory TrackingData object."""
 
-    zarr_path = str(zarr_path)
-    tracking_results = load_multi_object_tracking_from_zarr(zarr_path)
-    if object_type not in tracking_results:
-        available = ", ".join(sorted(tracking_results.keys()))
-        raise ValueError(
-            f"Object type '{object_type}' not found in tracking results. Available: {available}"
-        )
-
-    tracking = tracking_results[object_type]
     x = tracking.x.astype(float)
     y = tracking.y.astype(float)
     valid_mask = ~np.isnan(x) & ~np.isnan(y)
@@ -74,16 +67,40 @@ def compute_pulse_distance_series(
 
     mean_distance[counts == 0] = np.nan
     frame_indices = np.arange(tracking.n_frames, dtype=int)
-    fps = _read_fps(zarr_path)
-    if fps > 0:
-        time_seconds = frame_indices / fps
+    fps_value = float(fps) if isinstance(fps, (int, float)) else 0.0
+    if fps_value > 0:
+        time_axis = frame_indices / fps_value
     else:
-        time_seconds = frame_indices.astype(float)
+        time_axis = frame_indices.astype(float)
 
     return PulseAnalysisResult(
         frame_indices=frame_indices,
-        time_seconds=time_seconds,
+        time_seconds=time_axis,
         mean_distance_px=mean_distance,
+        fps=fps_value,
+        object_type=object_type,
+    )
+
+
+def compute_pulse_distance_series(
+    zarr_path: str | Path,
+    *,
+    object_type: str = "tentacle_bulb",
+) -> PulseAnalysisResult:
+    """Compute mean bulb distance from center-of-mass for every frame."""
+
+    zarr_path = str(zarr_path)
+    tracking_results = load_multi_object_tracking_from_zarr(zarr_path)
+    if object_type not in tracking_results:
+        available = ", ".join(sorted(tracking_results.keys()))
+        raise ValueError(
+            f"Object type '{object_type}' not found in tracking results. Available: {available}"
+        )
+
+    tracking = tracking_results[object_type]
+    fps = _read_fps(zarr_path)
+    return compute_pulse_distance_from_tracking(
+        tracking,
         fps=fps,
         object_type=object_type,
     )
